@@ -59,8 +59,8 @@ if(isset($_GET['delete'])) {
     $prod->execute([$id]);
     $product = $prod->fetch();
     
-    // Delete image file if exists
-    if($product && $product['image']) {
+    // Delete image file if exists and is local file
+    if($product && $product['image'] && !filter_var($product['image'], FILTER_VALIDATE_URL)) {
         $image_path = '../' . $product['image'];
         if(file_exists($image_path)) {
             unlink($image_path);
@@ -97,6 +97,9 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             background: #2c3e50;
             color: white;
             padding: 20px;
+            position: fixed;
+            height: 100vh;
+            overflow-y: auto;
         }
         .sidebar h2 { margin-bottom: 20px; }
         .sidebar h2 span { color: #ff6b6b; }
@@ -107,12 +110,14 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             padding: 10px;
             margin: 5px 0;
             border-radius: 5px;
+            transition: background 0.3s;
         }
         .sidebar a:hover, .sidebar a.active {
             background: #34495e;
         }
         .content {
             flex: 1;
+            margin-left: 250px;
             padding: 20px;
         }
         .header {
@@ -122,6 +127,9 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             margin-bottom: 20px;
             padding-bottom: 20px;
             border-bottom: 1px solid #ddd;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
         }
         .btn {
             padding: 10px 20px;
@@ -130,7 +138,10 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             cursor: pointer;
             text-decoration: none;
             display: inline-block;
+            font-size: 14px;
+            transition: opacity 0.3s;
         }
+        .btn:hover { opacity: 0.8; }
         .btn-primary {
             background: #ff6b6b;
             color: white;
@@ -151,6 +162,17 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             border-radius: 8px;
             margin-bottom: 30px;
             box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            animation: slideDown 0.3s ease;
+        }
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
         }
         .form-group {
             margin-bottom: 15px;
@@ -159,14 +181,22 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             display: block;
             margin-bottom: 5px;
             font-weight: 500;
+            color: #333;
         }
         .form-group input,
         .form-group select,
         .form-group textarea {
             width: 100%;
-            padding: 8px;
+            padding: 10px;
             border: 1px solid #ddd;
             border-radius: 4px;
+            font-size: 14px;
+        }
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: #ff6b6b;
         }
         .form-row {
             display: grid;
@@ -186,40 +216,89 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             border-bottom: 1px solid #ddd;
             vertical-align: middle;
         }
-        th { background: #34495e; color: white; }
+        th { 
+            background: #34495e; 
+            color: white;
+            font-weight: 600;
+        }
+        tr:hover {
+            background: #f8f9fa;
+        }
         .product-image {
-            width: 50px;
-            height: 50px;
+            width: 60px;
+            height: 60px;
             object-fit: cover;
-            border-radius: 5px;
+            border-radius: 8px;
+            display: block;
         }
         .no-image {
-            width: 50px;
-            height: 50px;
-            background: #f0f0f0;
+            width: 60px;
+            height: 60px;
+            background: linear-gradient(135deg, #f5f5f5, #e0e0e0);
             display: flex;
             align-items: center;
             justify-content: center;
-            border-radius: 5px;
+            border-radius: 8px;
+            font-size: 30px;
             color: #999;
         }
         .status {
-            padding: 3px 8px;
-            border-radius: 3px;
+            padding: 4px 10px;
+            border-radius: 20px;
             font-size: 12px;
+            font-weight: 600;
+            display: inline-block;
         }
-        .status.available { background: #4ecdc4; color: white; }
-        .status.out_of_stock { background: #ff6b6b; color: white; }
+        .status.available { 
+            background: #d4edda; 
+            color: #155724;
+        }
+        .status.out_of_stock { 
+            background: #f8d7da; 
+            color: #721c24;
+        }
         .msg {
-            padding: 10px;
+            padding: 12px;
             border-radius: 5px;
             margin-bottom: 20px;
+            animation: slideDown 0.3s ease;
         }
-        .msg.success { background: #d4edda; color: #155724; }
+        .msg.success { 
+            background: #d4edda; 
+            color: #155724;
+            border-left: 4px solid #28a745;
+        }
         .image-preview {
             max-width: 100px;
             max-height: 100px;
             margin-top: 10px;
+            border-radius: 5px;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #999;
+        }
+        .action-buttons {
+            display: flex;
+            gap: 5px;
+        }
+        @media (max-width: 768px) {
+            .sidebar {
+                width: 200px;
+            }
+            .content {
+                margin-left: 200px;
+            }
+            .form-row {
+                grid-template-columns: 1fr;
+            }
+            table {
+                font-size: 12px;
+            }
+            th, td {
+                padding: 8px;
+            }
         }
     </style>
 </head>
@@ -240,7 +319,7 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
         
         <div class="content">
             <div class="header">
-                <h1>Manage Products</h1>
+                <h1>🍰 Manage Products</h1>
                 <button class="btn btn-primary" onclick="toggleForm()">➕ Add New Product</button>
             </div>
             
@@ -255,16 +334,16 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             
             <!-- Add Product Form -->
             <div id="addForm" style="display: none;" class="add-form">
-                <h3>Add New Product</h3>
+                <h3>➕ Add New Product</h3>
                 <form method="POST" enctype="multipart/form-data">
                     <div class="form-group">
-                        <label>Product Name</label>
-                        <input type="text" name="name" required>
+                        <label>Product Name *</label>
+                        <input type="text" name="name" required placeholder="Enter product name">
                     </div>
                     
                     <div class="form-row">
                         <div class="form-group">
-                            <label>Category</label>
+                            <label>Category *</label>
                             <select name="category_id" required>
                                 <option value="">Select Category</option>
                                 <?php foreach($categories as $cat): ?>
@@ -274,32 +353,33 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
                         </div>
                         
                         <div class="form-group">
-                            <label>Price (₱)</label>
-                            <input type="number" name="price" step="0.01" required>
+                            <label>Price (₱) *</label>
+                            <input type="number" name="price" step="0.01" required placeholder="0.00">
                         </div>
                     </div>
                     
                     <div class="form-row">
                         <div class="form-group">
-                            <label>Stock</label>
-                            <input type="number" name="stock" required>
+                            <label>Stock *</label>
+                            <input type="number" name="stock" required placeholder="Quantity">
                         </div>
                         
                         <div class="form-group">
                             <label>Product Image</label>
                             <input type="file" name="image" accept="image/*" onchange="previewImage(this)">
+                            <small style="color: #666;">Allowed: JPG, JPEG, PNG, GIF</small>
                         </div>
                     </div>
                     
                     <div class="form-group">
                         <label>Description</label>
-                        <textarea name="description" rows="3"></textarea>
+                        <textarea name="description" rows="3" placeholder="Enter product description..."></textarea>
                     </div>
                     
                     <div id="imagePreview"></div>
                     
-                    <button type="submit" name="add_product" class="btn btn-primary">Save Product</button>
-                    <button type="button" class="btn" style="background:#ccc;" onclick="toggleForm()">Cancel</button>
+                    <button type="submit" name="add_product" class="btn btn-primary">💾 Save Product</button>
+                    <button type="button" class="btn" style="background:#6c757d; color:white;" onclick="toggleForm()">❌ Cancel</button>
                 </form>
             </div>
             
@@ -318,26 +398,54 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
                     </tr>
                 </thead>
                 <tbody>
-                    <?php foreach($products as $product): ?>
-                    <tr>
-                        <td>
-                            <?php if($product['image']): ?>
-                                <img src="../<?php echo htmlspecialchars($product['image']); ?>" class="product-image">
-                            <?php else: ?>
-                                <div class="no-image">🍰</div>
-                            <?php endif; ?>
-                        </td>
-                        <td><?php echo $product['id']; ?></td>
-                        <td><?php echo htmlspecialchars($product['name']); ?></td>
-                        <td><?php echo htmlspecialchars($product['category_name'] ?: 'Uncategorized'); ?></td>
-                        <td>₱<?php echo number_format($product['price'], 2); ?></td>
-                        <td><?php echo $product['stock']; ?></td>
-                        <td><span class="status <?php echo $product['status']; ?>"><?php echo $product['status']; ?></span></td>
-                        <td>
-                            <a href="?delete=<?php echo $product['id']; ?>" class="btn btn-danger" onclick="return confirm('Delete this product?')">Delete</a>
-                        </td>
-                    </tr>
-                    <?php endforeach; ?>
+                    <?php if(count($products) > 0): ?>
+                        <?php foreach($products as $product): ?>
+                        <tr>
+                            <td>
+                                <?php 
+                                // Check if image exists
+                                if(!empty($product['image'])):
+                                    // Check if it's a URL or local path
+                                    if(filter_var($product['image'], FILTER_VALIDATE_URL)):
+                                        // Online image URL
+                                        echo '<img src="' . htmlspecialchars($product['image']) . '" class="product-image" alt="' . htmlspecialchars($product['name']) . '">';
+                                    else:
+                                        // Local image path - check if file exists
+                                        $image_path = '../' . $product['image'];
+                                        if(file_exists($image_path)):
+                                            echo '<img src="../' . htmlspecialchars($product['image']) . '" class="product-image" alt="' . htmlspecialchars($product['name']) . '">';
+                                        else:
+                                            echo '<div class="no-image">🍰</div>';
+                                        endif;
+                                    endif;
+                                else:
+                                    echo '<div class="no-image">🍰</div>';
+                                endif;
+                                ?>
+                            </td>
+                            <td><?php echo $product['id']; ?></td>
+                            <td><strong><?php echo htmlspecialchars($product['name']); ?></strong></td>
+                            <td><?php echo htmlspecialchars($product['category_name'] ?: 'Uncategorized'); ?></td>
+                            <td>₱<?php echo number_format($product['price'], 2); ?></td>
+                            <td><?php echo $product['stock']; ?></td>
+                            <td>
+                                <span class="status <?php echo $product['status']; ?>">
+                                    <?php echo ucfirst($product['status']); ?>
+                                </span>
+                            </td>
+                            <td class="action-buttons">
+                                <a href="edit_product.php?id=<?php echo $product['id']; ?>" class="btn btn-primary" style="padding: 5px 10px; font-size: 12px;">✏️ Edit</a>
+                                <a href="?delete=<?php echo $product['id']; ?>" class="btn btn-danger" onclick="return confirm('Are you sure you want to delete this product?')">🗑️ Delete</a>
+                            </td>
+                        </tr>
+                        <?php endforeach; ?>
+                    <?php else: ?>
+                        <tr>
+                            <td colspan="8" class="empty-state">
+                                🍰 No products found. Click "Add New Product" to get started!
+                            </td>
+                        </tr>
+                    <?php endif; ?>
                 </tbody>
             </table>
         </div>
@@ -348,6 +456,7 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             var form = document.getElementById('addForm');
             if(form.style.display === 'none') {
                 form.style.display = 'block';
+                form.scrollIntoView({ behavior: 'smooth' });
             } else {
                 form.style.display = 'none';
             }
@@ -363,11 +472,21 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
                     var img = document.createElement('img');
                     img.src = e.target.result;
                     img.className = 'image-preview';
+                    img.style.border = '1px solid #ddd';
+                    img.style.padding = '5px';
                     preview.appendChild(img);
                 }
                 reader.readAsDataURL(input.files[0]);
             }
         }
+        
+        // Auto-hide success message after 3 seconds
+        setTimeout(function() {
+            var msg = document.querySelector('.msg');
+            if(msg) {
+                msg.style.display = 'none';
+            }
+        }, 3000);
     </script>
 </body>
 </html>
