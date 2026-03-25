@@ -1,0 +1,14 @@
+{
+    "name": "cake-shop-ordering-system",
+    "description": "Real-time Cake Ordering System with WebSocket",
+    "type": "project",
+    "require": {
+        "php": ">=7.4",
+        "cboden/ratchet": "^0.4.4"
+    },
+    "autoload": {
+        "psr-4": {
+            "CakeShop\\": "src/"
+        }
+    }
+}
