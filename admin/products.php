@@ -1,109 +1,18 @@
 <?php
 session_start();
 require_once '../db.php';
-require_once '../websocket_client.php'; // ADD THIS LINE
+require_once '../websocket_client.php';
 
 if(!isset($_SESSION['user_id']) || $_SESSION['role'] != 'admin') {
     header("Location: ../login.php");
     exit();
 }
 
-// Create upload directory if it doesn't exist
-$upload_dir = '../uploads/products/';
-if (!file_exists($upload_dir)) {
-    mkdir($upload_dir, 0777, true);
-}
-
-// Handle Add Product with Image
-if(isset($_POST['add_product'])) {
-    $name = $_POST['name'];
-    $category_id = $_POST['category_id'];
-    $price = $_POST['price'];
-    $stock = $_POST['stock'];
-    $description = $_POST['description'];
-    $image = '';
-    
-    // Handle image upload
-    if(isset($_FILES['image']) && $_FILES['image']['error'] == 0) {
-        $allowed = ['jpg', 'jpeg', 'png', 'gif'];
-        $filename = $_FILES['image']['name'];
-        $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
-        
-        if(in_array($ext, $allowed)) {
-            // Generate unique filename
-            $new_filename = uniqid() . '.' . $ext;
-            $upload_path = $upload_dir . $new_filename;
-            
-            if(move_uploaded_file($_FILES['image']['tmp_name'], $upload_path)) {
-                $image = 'uploads/products/' . $new_filename;
-            }
-        }
-    }
-    
-    $stmt = $conn->prepare("INSERT INTO products (name, category_id, price, stock, description, image, status) VALUES (?, ?, ?, ?, ?, ?, 'available')");
-    $stmt->execute([$name, $category_id, $price, $stock, $description, $image]);
-    $new_id = $conn->lastInsertId();
-    
-    // Log audit
-    $log = $conn->prepare("INSERT INTO audit_logs (user_id, action, table_name, record_id, details) VALUES (?, 'CREATE', 'products', ?, ?)");
-    $log->execute([$_SESSION['user_id'], $new_id, "Added product: $name"]);
-    
-    // ADD WEBSOCKET BROADCAST FOR PRODUCT ADDED
-    broadcastWebSocket('product_added', [
-        'id' => $new_id,
-        'name' => $name,
-        'price' => $price,
-        'stock' => $stock,
-        'image' => $image,
-        'category_id' => $category_id,
-        'action_by' => $_SESSION['full_name']
-    ]);
-    
-    header("Location: products.php?msg=added");
-    exit();
-}
-
-// Handle Delete Product
-if(isset($_GET['delete'])) {
-    $id = $_GET['delete'];
-    
-    // Get product info to delete image too
-    $prod = $conn->prepare("SELECT name, image FROM products WHERE id = ?");
-    $prod->execute([$id]);
-    $product = $prod->fetch();
-    $product_name = $product['name'] ?? 'Unknown';
-    
-    // Delete image file if exists and is local file
-    if($product && $product['image'] && !filter_var($product['image'], FILTER_VALIDATE_URL)) {
-        $image_path = '../' . $product['image'];
-        if(file_exists($image_path)) {
-            unlink($image_path);
-        }
-    }
-    
-    $stmt = $conn->prepare("DELETE FROM products WHERE id = ?");
-    $stmt->execute([$id]);
-    
-    // Log audit
-    $log = $conn->prepare("INSERT INTO audit_logs (user_id, action, table_name, record_id, details) VALUES (?, 'DELETE', 'products', ?, ?)");
-    $log->execute([$_SESSION['user_id'], $id, "Deleted product: $product_name"]);
-    
-    // ADD WEBSOCKET BROADCAST FOR PRODUCT DELETED
-    broadcastWebSocket('product_deleted', [
-        'id' => $id,
-        'name' => $product_name,
-        'action_by' => $_SESSION['full_name']
-    ]);
-    
-    header("Location: products.php?msg=deleted");
-    exit();
-}
-
-// Get all products
-$products = $conn->query("SELECT p.*, c.name as category_name FROM products p LEFT JOIN categories c ON p.category_id = c.id ORDER BY p.id DESC")->fetchAll();
-
 // Get categories
 $categories = $conn->query("SELECT * FROM categories")->fetchAll();
+
+// Get all products (initial load via PHP, will be refreshed via WebSocket)
+$products = $conn->query("SELECT p.*, c.name as category_name FROM products p LEFT JOIN categories c ON p.category_id = c.id ORDER BY p.id DESC")->fetchAll();
 ?>
 <!DOCTYPE html>
 <html>
@@ -343,6 +252,26 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             to { transform: translateX(100%); opacity: 0; }
         }
         
+        /* Loading Overlay */
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 10000;
+        }
+        .loading-spinner {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            font-size: 18px;
+        }
+        
         @media (max-width: 768px) {
             .sidebar {
                 width: 200px;
@@ -383,29 +312,21 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
                 <button class="btn btn-primary" onclick="toggleForm()">➕ Add New Product</button>
             </div>
             
-            <?php if(isset($_GET['msg'])): ?>
-                <div class="msg success">
-                    <?php 
-                    if($_GET['msg'] == 'added') echo "✅ Product added successfully!";
-                    if($_GET['msg'] == 'deleted') echo "✅ Product deleted successfully!";
-                    if($_GET['msg'] == 'updated') echo "✅ Product updated successfully!";
-                    ?>
-                </div>
-            <?php endif; ?>
+            <div id="successMsg" class="msg success" style="display: none;"></div>
             
-            <!-- Add Product Form -->
+            <!-- Add Product Form - Now uses WebSocket instead of HTTP POST -->
             <div id="addForm" style="display: none;" class="add-form">
                 <h3>➕ Add New Product</h3>
-                <form method="POST" enctype="multipart/form-data">
+                <form id="productForm" enctype="multipart/form-data">
                     <div class="form-group">
                         <label>Product Name *</label>
-                        <input type="text" name="name" required placeholder="Enter product name">
+                        <input type="text" id="productName" required placeholder="Enter product name">
                     </div>
                     
                     <div class="form-row">
                         <div class="form-group">
                             <label>Category *</label>
-                            <select name="category_id" required>
+                            <select id="categoryId" required>
                                 <option value="">Select Category</option>
                                 <?php foreach($categories as $cat): ?>
                                 <option value="<?php echo $cat['id']; ?>"><?php echo htmlspecialchars($cat['name']); ?></option>
@@ -415,104 +336,314 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
                         
                         <div class="form-group">
                             <label>Price (₱) *</label>
-                            <input type="number" name="price" step="0.01" required placeholder="0.00">
+                            <input type="number" id="productPrice" step="0.01" required placeholder="0.00">
                         </div>
                     </div>
                     
                     <div class="form-row">
                         <div class="form-group">
                             <label>Stock *</label>
-                            <input type="number" name="stock" required placeholder="Quantity">
+                            <input type="number" id="productStock" required placeholder="Quantity">
                         </div>
                         
                         <div class="form-group">
-                            <label>Product Image</label>
-                            <input type="file" name="image" accept="image/*" onchange="previewImage(this)">
-                            <small style="color: #666;">Allowed: JPG, JPEG, PNG, GIF</small>
+                            <label>Product Image URL</label>
+                            <input type="text" id="productImage" placeholder="https://example.com/image.jpg">
+                            <small style="color: #666;">Paste image URL or leave empty</small>
                         </div>
                     </div>
                     
                     <div class="form-group">
                         <label>Description</label>
-                        <textarea name="description" rows="3" placeholder="Enter product description..."></textarea>
+                        <textarea id="productDescription" rows="3" placeholder="Enter product description..."></textarea>
                     </div>
                     
                     <div id="imagePreview"></div>
                     
-                    <button type="submit" name="add_product" class="btn btn-primary">💾 Save Product</button>
+                    <button type="submit" class="btn btn-primary">💾 Save Product</button>
                     <button type="button" class="btn" style="background:#6c757d; color:white;" onclick="toggleForm()">❌ Cancel</button>
                 </form>
             </div>
             
             <!-- Products Table -->
-            <table>
-                <thead>
-                    <tr>
-                        <th>Image</th>
-                        <th>ID</th>
-                        <th>Name</th>
-                        <th>Category</th>
-                        <th>Price</th>
-                        <th>Stock</th>
-                        <th>Status</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php if(count($products) > 0): ?>
-                        <?php foreach($products as $product): ?>
+            <div id="productsTableContainer">
+                <table id="productsTable">
+                    <thead>
                         <tr>
-                            <td>
-                                <?php 
-                                // Check if image exists
-                                if(!empty($product['image'])):
-                                    // Check if it's a URL or local path
-                                    if(filter_var($product['image'], FILTER_VALIDATE_URL)):
-                                        // Online image URL
-                                        echo '<img src="' . htmlspecialchars($product['image']) . '" class="product-image" alt="' . htmlspecialchars($product['name']) . '">';
-                                    else:
-                                        // Local image path - check if file exists
-                                        $image_path = '../' . $product['image'];
-                                        if(file_exists($image_path)):
-                                            echo '<img src="../' . htmlspecialchars($product['image']) . '" class="product-image" alt="' . htmlspecialchars($product['name']) . '">';
+                            <th>Image</th>
+                            <th>ID</th>
+                            <th>Name</th>
+                            <th>Category</th>
+                            <th>Price</th>
+                            <th>Stock</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </thead>
+                    <tbody id="productsTableBody">
+                        <?php if(count($products) > 0): ?>
+                            <?php foreach($products as $product): ?>
+                            <tr data-id="<?php echo $product['id']; ?>">
+                                <td>
+                                    <?php 
+                                    if(!empty($product['image'])):
+                                        if(filter_var($product['image'], FILTER_VALIDATE_URL)):
+                                            echo '<img src="' . htmlspecialchars($product['image']) . '" class="product-image" alt="' . htmlspecialchars($product['name']) . '">';
                                         else:
-                                            echo '<div class="no-image">🍰</div>';
+                                            $image_path = '../' . $product['image'];
+                                            if(file_exists($image_path)):
+                                                echo '<img src="../' . htmlspecialchars($product['image']) . '" class="product-image" alt="' . htmlspecialchars($product['name']) . '">';
+                                            else:
+                                                echo '<div class="no-image">🍰</div>';
+                                            endif;
                                         endif;
+                                    else:
+                                        echo '<div class="no-image">🍰</div>';
                                     endif;
-                                else:
-                                    echo '<div class="no-image">🍰</div>';
-                                endif;
-                                ?>
-                            </td>
-                            <td><?php echo $product['id']; ?></td>
-                            <td><strong><?php echo htmlspecialchars($product['name']); ?></strong></td>
-                            <td><?php echo htmlspecialchars($product['category_name'] ?: 'Uncategorized'); ?></td>
-                            <td>₱<?php echo number_format($product['price'], 2); ?></td>
-                            <td><?php echo $product['stock']; ?></td>
-                            <td>
-                                <span class="status <?php echo $product['status']; ?>">
-                                    <?php echo ucfirst($product['status']); ?>
-                                </span>
-                            </td>
-                            <td class="action-buttons">
-                                <a href="edit_product.php?id=<?php echo $product['id']; ?>" class="btn btn-primary" style="padding: 5px 10px; font-size: 12px;">✏️ Edit</a>
-                                <a href="?delete=<?php echo $product['id']; ?>" class="btn btn-danger" onclick="return confirm('Are you sure you want to delete this product?')">🗑️ Delete</a>
-                            </td>
-                        </tr>
-                        <?php endforeach; ?>
-                    <?php else: ?>
-                        <tr>
-                            <td colspan="8" class="empty-state">
-                                🍰 No products found. Click "Add New Product" to get started!
-                            </td>
-                        </tr>
-                    <?php endif; ?>
-                </tbody>
-            </table>
+                                    ?>
+                                </td>
+                                <td><?php echo $product['id']; ?></td>
+                                <td><strong><?php echo htmlspecialchars($product['name']); ?></strong></td>
+                                <td><?php echo htmlspecialchars($product['category_name'] ?: 'Uncategorized'); ?></td>
+                                <td>₱<?php echo number_format($product['price'], 2); ?></td>
+                                <td><?php echo $product['stock']; ?></td>
+                                <td><span class="status <?php echo $product['status']; ?>"><?php echo ucfirst($product['status']); ?></span></td>
+                                <td class="action-buttons">
+                                    <button onclick="editProduct(<?php echo $product['id']; ?>)" class="btn btn-primary" style="padding: 5px 10px; font-size: 12px;">✏️ Edit</button>
+                                    <button onclick="deleteProduct(<?php echo $product['id']; ?>, '<?php echo addslashes($product['name']); ?>')" class="btn btn-danger" style="padding: 5px 10px; font-size: 12px;">🗑️ Delete</button>
+                                </td>
+                            </tr>
+                            <?php endforeach; ?>
+                        <?php else: ?>
+                            <tr><td colspan="8" class="empty-state">🍰 No products found. Click "Add New Product" to get started!</td></tr>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
         </div>
     </div>
     
+    <!-- Loading Overlay -->
+    <div id="loadingOverlay" class="loading-overlay">
+        <div class="loading-spinner">⏳ Processing...</div>
+    </div>
+    
     <script>
+        // ========== WEBSOCKET CLIENT ==========
+        let ws;
+        let reconnectAttempts = 0;
+        
+        function connectWebSocket() {
+            ws = new WebSocket('ws://localhost:8080');
+            
+            ws.onopen = function() {
+                console.log('✅ Connected to WebSocket');
+                reconnectAttempts = 0;
+                showNotification('Connected to real-time server', 'success');
+                
+                // Authenticate
+                ws.send(JSON.stringify({
+                    type: 'auth',
+                    user_id: <?php echo $_SESSION['user_id']; ?>,
+                    role: '<?php echo $_SESSION['role']; ?>',
+                    username: '<?php echo $_SESSION['username']; ?>'
+                }));
+                
+                // Send ping every 30 seconds
+                setInterval(() => {
+                    if(ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'ping' }));
+                    }
+                }, 30000);
+            };
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                console.log('📨 Message received:', data.type);
+                
+                switch(data.type) {
+                    case 'welcome':
+                        showNotification(data.message, 'success');
+                        break;
+                        
+                    case 'auth_success':
+                        console.log('Authenticated successfully');
+                        // Refresh products after authentication
+                        refreshProducts();
+                        break;
+                        
+                    case 'PRODUCT_LIST':
+                        updateProductsTable(data.payload);
+                        break;
+                        
+                    case 'PRODUCT_CREATED':
+                        showNotification(`🆕 New product: ${data.payload.name} added`, 'info');
+                        refreshProducts();
+                        break;
+                        
+                    case 'PRODUCT_UPDATED':
+                        showNotification(`✏️ Product updated: ${data.payload.name}`, 'info');
+                        refreshProducts();
+                        break;
+                        
+                    case 'PRODUCT_DELETED':
+                        showNotification(`🗑️ Product deleted: ${data.payload.name}`, 'warning');
+                        refreshProducts();
+                        break;
+                        
+                    case 'CREATE_SUCCESS':
+                        showNotification(data.message, 'success');
+                        toggleForm();
+                        document.getElementById('productForm').reset();
+                        break;
+                        
+                    case 'UPDATE_SUCCESS':
+                        showNotification(data.message, 'success');
+                        break;
+                        
+                    case 'DELETE_SUCCESS':
+                        showNotification(data.message, 'success');
+                        break;
+                        
+                    case 'ORDER_CREATED':
+                        showNotification(`📦 New order #${data.payload.order_number} from ${data.payload.username}`, 'success');
+                        break;
+                        
+                    case 'pong':
+                        // Keep alive
+                        break;
+                        
+                    default:
+                        console.log('Unknown message type:', data.type);
+                }
+            };
+            
+            ws.onclose = function() {
+                console.log('❌ WebSocket Disconnected');
+                if(reconnectAttempts < 5) {
+                    reconnectAttempts++;
+                    setTimeout(connectWebSocket, 3000);
+                }
+            };
+        }
+        
+        function refreshProducts() {
+            if(ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'READ_PRODUCTS',
+                    payload: {}
+                }));
+            }
+        }
+        
+        function updateProductsTable(products) {
+            const tbody = document.getElementById('productsTableBody');
+            if(!tbody) return;
+            
+            if(products.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" class="empty-state">🍰 No products found. Click "Add New Product" to get started!</td></tr>';
+                return;
+            }
+            
+            let html = '';
+            products.forEach(product => {
+                let imageHtml = '';
+                if(product.image) {
+                    if(product.image.startsWith('http')) {
+                        imageHtml = `<img src="${escapeHtml(product.image)}" class="product-image" alt="${escapeHtml(product.name)}">`;
+                    } else {
+                        imageHtml = `<img src="../${escapeHtml(product.image)}" class="product-image" alt="${escapeHtml(product.name)}">`;
+                    }
+                } else {
+                    imageHtml = '<div class="no-image">🍰</div>';
+                }
+                
+                html += `
+                    <tr data-id="${product.id}">
+                        <td>${imageHtml}</td>
+                        <td>${product.id}</td>
+                        <td><strong>${escapeHtml(product.name)}</strong></td>
+                        <td>${escapeHtml(product.category_name || 'Uncategorized')}</td>
+                        <td>₱${parseFloat(product.price).toFixed(2)}</td>
+                        <td>${product.stock}</td>
+                        <td><span class="status ${product.status}">${product.status.charAt(0).toUpperCase() + product.status.slice(1)}</span></td>
+                        <td class="action-buttons">
+                            <button onclick="editProduct(${product.id})" class="btn btn-primary" style="padding: 5px 10px; font-size: 12px;">✏️ Edit</button>
+                            <button onclick="deleteProduct(${product.id}, '${escapeHtml(product.name)}')" class="btn btn-danger" style="padding: 5px 10px; font-size: 12px;">🗑️ Delete</button>
+                        </td>
+                    </tr>
+                `;
+            });
+            tbody.innerHTML = html;
+        }
+        
+        function escapeHtml(str) {
+            if(!str) return '';
+            return str.replace(/[&<>]/g, function(m) {
+                if(m === '&') return '&amp;';
+                if(m === '<') return '&lt;';
+                if(m === '>') return '&gt;';
+                return m;
+            });
+        }
+        
+        // CREATE PRODUCT via WebSocket
+        function createProduct() {
+            const name = document.getElementById('productName').value;
+            const category_id = document.getElementById('categoryId').value;
+            const price = document.getElementById('productPrice').value;
+            const stock = document.getElementById('productStock').value;
+            const description = document.getElementById('productDescription').value;
+            const image = document.getElementById('productImage').value;
+            
+            if(!name || !category_id || !price || !stock) {
+                showNotification('Please fill all required fields', 'warning');
+                return;
+            }
+            
+            if(ws && ws.readyState === WebSocket.OPEN) {
+                showLoading(true);
+                ws.send(JSON.stringify({
+                    type: 'CREATE_PRODUCT',
+                    payload: {
+                        name: name,
+                        category_id: parseInt(category_id),
+                        price: parseFloat(price),
+                        stock: parseInt(stock),
+                        description: description,
+                        image: image
+                    }
+                }));
+                showLoading(false);
+            } else {
+                showNotification('WebSocket not connected. Please refresh the page.', 'warning');
+            }
+        }
+        
+        // DELETE PRODUCT via WebSocket
+        function deleteProduct(id, name) {
+            if(confirm(`Are you sure you want to delete "${name}"?`)) {
+                if(ws && ws.readyState === WebSocket.OPEN) {
+                    showLoading(true);
+                    ws.send(JSON.stringify({
+                        type: 'DELETE_PRODUCT',
+                        payload: {
+                            id: id,
+                            name: name
+                        }
+                    }));
+                    showLoading(false);
+                } else {
+                    showNotification('WebSocket not connected. Please refresh the page.', 'warning');
+                }
+            }
+        }
+        
+        // EDIT PRODUCT (will be implemented via edit_product.php or WebSocket modal)
+        function editProduct(id) {
+            window.location.href = `edit_product.php?id=${id}`;
+        }
+        
+        // UI Functions
         function toggleForm() {
             var form = document.getElementById('addForm');
             if(form.style.display === 'none') {
@@ -535,97 +666,10 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
                     img.className = 'image-preview';
                     img.style.border = '1px solid #ddd';
                     img.style.padding = '5px';
+                    img.style.maxWidth = '100px';
                     preview.appendChild(img);
                 }
                 reader.readAsDataURL(input.files[0]);
-            }
-        }
-        
-        // Auto-hide success message after 3 seconds
-        setTimeout(function() {
-            var msg = document.querySelector('.msg');
-            if(msg) {
-                msg.style.display = 'none';
-            }
-        }, 3000);
-        
-        // ========== WEBSOCKET CLIENT ==========
-        let ws;
-        let reconnectAttempts = 0;
-        
-        function connectWebSocket() {
-            ws = new WebSocket('ws://localhost:8080');
-            
-            ws.onopen = function() {
-                console.log('✅ Connected to WebSocket');
-                reconnectAttempts = 0;
-                
-                // Authenticate
-                ws.send(JSON.stringify({
-                    type: 'auth',
-                    user_id: <?php echo $_SESSION['user_id']; ?>,
-                    role: '<?php echo $_SESSION['role']; ?>'
-                }));
-                
-                // Send ping every 30 seconds
-                setInterval(() => {
-                    if(ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ type: 'ping' }));
-                    }
-                }, 30000);
-            };
-            
-            ws.onmessage = function(event) {
-                const data = JSON.parse(event.data);
-                
-                switch(data.type) {
-                    case 'welcome':
-                        showNotification('Connected to real-time server', 'success');
-                        break;
-                        
-                    case 'crud':
-                        handleCRUDEvent(data);
-                        break;
-                        
-                    case 'pong':
-                        // Keep alive
-                        break;
-                }
-            };
-            
-            ws.onclose = function() {
-                console.log('❌ WebSocket Disconnected');
-                if(reconnectAttempts < 5) {
-                    reconnectAttempts++;
-                    setTimeout(connectWebSocket, 3000);
-                }
-            };
-        }
-        
-        function handleCRUDEvent(data) {
-            const { action, data: eventData } = data;
-            
-            switch(action) {
-                case 'product_added':
-                    showNotification(`🆕 New product: ${eventData.name} added by ${eventData.action_by}`, 'info');
-                    break;
-                    
-                case 'product_updated':
-                    showNotification(`✏️ Product updated: ${eventData.name}`, 'info');
-                    break;
-                    
-                case 'product_deleted':
-                    showNotification(`🗑️ Product deleted: ${eventData.name}`, 'warning');
-                    break;
-                    
-                case 'order_placed':
-                    showNotification(`📦 New order #${eventData.order_number} from ${eventData.username}`, 'success');
-                    break;
-            }
-            
-            // Refresh page if on products page
-            if(action.includes('product') && window.location.href.includes('products.php')) {
-                setTimeout(() => location.reload(), 2000);
             }
         }
         
@@ -650,8 +694,24 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             }, 5000);
         }
         
-        // Connect WebSocket when page loads
-        document.addEventListener('DOMContentLoaded', connectWebSocket);
+        function showLoading(show) {
+            const overlay = document.getElementById('loadingOverlay');
+            if(overlay) {
+                overlay.style.display = show ? 'flex' : 'none';
+            }
+        }
+        
+        // Form submission handler
+        document.addEventListener('DOMContentLoaded', function() {
+            const form = document.getElementById('productForm');
+            if(form) {
+                form.addEventListener('submit', function(e) {
+                    e.preventDefault();
+                    createProduct();
+                });
+            }
+            connectWebSocket();
+        });
     </script>
 </body>
 </html>

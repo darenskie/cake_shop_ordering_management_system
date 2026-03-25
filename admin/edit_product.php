@@ -1,7 +1,7 @@
 <?php
 session_start();
 require_once '../db.php';
-require_once '../websocket_client.php'; // ADD THIS LINE
+require_once '../websocket_client.php';
 
 if(!isset($_SESSION['user_id']) || $_SESSION['role'] != 'admin') {
     header("Location: ../login.php");
@@ -21,80 +21,9 @@ if(!$product) {
     exit();
 }
 
-// Handle update
-if(isset($_POST['update_product'])) {
-    $name = $_POST['name'];
-    $category_id = $_POST['category_id'];
-    $price = $_POST['price'];
-    $stock = $_POST['stock'];
-    $description = $_POST['description'];
-    $status = $_POST['status'];
-    $current_image = $product['image'];
-    $image = $current_image;
-    
-    // Handle new image upload
-    if(isset($_FILES['image']) && $_FILES['image']['error'] == 0) {
-        $allowed = ['jpg', 'jpeg', 'png', 'gif'];
-        $filename = $_FILES['image']['name'];
-        $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
-        
-        if(in_array($ext, $allowed)) {
-            // Create upload directory if not exists
-            $upload_dir = '../uploads/products/';
-            if (!file_exists($upload_dir)) {
-                mkdir($upload_dir, 0777, true);
-            }
-            
-            // Generate unique filename
-            $new_filename = uniqid() . '.' . $ext;
-            $upload_path = $upload_dir . $new_filename;
-            
-            if(move_uploaded_file($_FILES['image']['tmp_name'], $upload_path)) {
-                // Delete old image if exists and is local file
-                if($current_image && !filter_var($current_image, FILTER_VALIDATE_URL)) {
-                    $old_path = '../' . $current_image;
-                    if(file_exists($old_path)) {
-                        unlink($old_path);
-                    }
-                }
-                $image = 'uploads/products/' . $new_filename;
-            }
-        }
-    }
-    
-    // Handle image URL input
-    if(!empty($_POST['image_url'])) {
-        $image = $_POST['image_url'];
-    }
-    
-    // Update product
-    $update = $conn->prepare("UPDATE products SET name = ?, category_id = ?, price = ?, stock = ?, description = ?, image = ?, status = ? WHERE id = ?");
-    $update->execute([$name, $category_id, $price, $stock, $description, $image, $status, $product_id]);
-    
-    // Log audit
-    $log = $conn->prepare("INSERT INTO audit_logs (user_id, action, table_name, record_id, details) VALUES (?, 'UPDATE', 'products', ?, ?)");
-    $log->execute([$_SESSION['user_id'], $product_id, "Updated product: $name"]);
-    
-    // ADD WEBSOCKET BROADCAST FOR PRODUCT UPDATED
-    broadcastWebSocket('product_updated', [
-        'id' => $product_id,
-        'name' => $name,
-        'price' => $price,
-        'stock' => $stock,
-        'status' => $status,
-        'image' => $image,
-        'category_id' => $category_id,
-        'action_by' => $_SESSION['full_name']
-    ]);
-    
-    header("Location: products.php?msg=updated");
-    exit();
-}
-
 // Get categories for dropdown
 $categories = $conn->query("SELECT * FROM categories")->fetchAll();
 ?>
-
 <!DOCTYPE html>
 <html>
 <head>
@@ -277,6 +206,26 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             to { transform: translateX(100%); opacity: 0; }
         }
         
+        /* Loading Overlay */
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 10000;
+        }
+        .loading-spinner {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            font-size: 18px;
+        }
+        
         @media (max-width: 768px) {
             .sidebar {
                 width: 200px;
@@ -312,16 +261,16 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             </div>
             
             <div class="form-container">
-                <form method="POST" enctype="multipart/form-data">
+                <form id="editProductForm">
                     <div class="form-row">
                         <div class="form-group">
                             <label>Product Name *</label>
-                            <input type="text" name="name" value="<?php echo htmlspecialchars($product['name']); ?>" required>
+                            <input type="text" id="productName" value="<?php echo htmlspecialchars($product['name']); ?>" required>
                         </div>
                         
                         <div class="form-group">
                             <label>Category *</label>
-                            <select name="category_id" required>
+                            <select id="categoryId" required>
                                 <option value="">Select Category</option>
                                 <?php foreach($categories as $cat): ?>
                                 <option value="<?php echo $cat['id']; ?>" <?php echo $product['category_id'] == $cat['id'] ? 'selected' : ''; ?>>
@@ -335,23 +284,23 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
                     <div class="form-row">
                         <div class="form-group">
                             <label>Price (₱) *</label>
-                            <input type="number" name="price" step="0.01" value="<?php echo $product['price']; ?>" required>
+                            <input type="number" id="productPrice" step="0.01" value="<?php echo $product['price']; ?>" required>
                         </div>
                         
                         <div class="form-group">
                             <label>Stock *</label>
-                            <input type="number" name="stock" value="<?php echo $product['stock']; ?>" required>
+                            <input type="number" id="productStock" value="<?php echo $product['stock']; ?>" required>
                         </div>
                     </div>
                     
                     <div class="form-group">
                         <label>Description</label>
-                        <textarea name="description" rows="4"><?php echo htmlspecialchars($product['description']); ?></textarea>
+                        <textarea id="productDescription" rows="4"><?php echo htmlspecialchars($product['description']); ?></textarea>
                     </div>
                     
                     <div class="form-group">
                         <label>Status</label>
-                        <select name="status">
+                        <select id="productStatus">
                             <option value="available" <?php echo $product['status'] == 'available' ? 'selected' : ''; ?>>Available</option>
                             <option value="out_of_stock" <?php echo $product['status'] == 'out_of_stock' ? 'selected' : ''; ?>>Out of Stock</option>
                         </select>
@@ -386,20 +335,20 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
                     
                     <div class="form-group">
                         <label>📁 Upload New Image</label>
-                        <input type="file" name="image" accept="image/*" onchange="previewImage(this)">
+                        <input type="file" id="productImageFile" accept="image/*" onchange="previewImage(this)">
                         <p class="help-text">Allowed: JPG, JPEG, PNG, GIF. Leave empty to keep current image.</p>
                         <div id="imagePreview"></div>
                     </div>
                     
                     <div class="form-group">
                         <label>🔗 OR Enter Image URL</label>
-                        <input type="text" name="image_url" placeholder="https://example.com/cake-image.jpg" 
+                        <input type="text" id="productImageUrl" placeholder="https://example.com/cake-image.jpg" 
                                value="<?php echo filter_var($product['image'], FILTER_VALIDATE_URL) ? $product['image'] : ''; ?>">
                         <p class="help-text">Paste a direct link to an image from the web (e.g., from Pexels, Unsplash)</p>
                     </div>
                     
                     <div class="button-group">
-                        <button type="submit" name="update_product" class="btn btn-primary">💾 Save Changes</button>
+                        <button type="submit" class="btn btn-primary">💾 Save Changes</button>
                         <a href="products.php" class="btn btn-secondary">❌ Cancel</a>
                     </div>
                 </form>
@@ -407,7 +356,137 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
         </div>
     </div>
     
+    <!-- Loading Overlay -->
+    <div id="loadingOverlay" class="loading-overlay">
+        <div class="loading-spinner">⏳ Updating product...</div>
+    </div>
+    
     <script>
+        // ========== WEBSOCKET CLIENT ==========
+        let ws;
+        let reconnectAttempts = 0;
+        let productId = <?php echo $product_id; ?>;
+        
+        function connectWebSocket() {
+            ws = new WebSocket('ws://localhost:8080');
+            
+            ws.onopen = function() {
+                console.log('✅ Connected to WebSocket');
+                reconnectAttempts = 0;
+                showNotification('Connected to real-time server', 'success');
+                
+                // Authenticate
+                ws.send(JSON.stringify({
+                    type: 'auth',
+                    user_id: <?php echo $_SESSION['user_id']; ?>,
+                    role: '<?php echo $_SESSION['role']; ?>',
+                    username: '<?php echo $_SESSION['username']; ?>'
+                }));
+                
+                // Send ping every 30 seconds
+                setInterval(() => {
+                    if(ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'ping' }));
+                    }
+                }, 30000);
+            };
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                console.log('📨 Message received:', data.type);
+                
+                switch(data.type) {
+                    case 'welcome':
+                        showNotification(data.message, 'success');
+                        break;
+                        
+                    case 'auth_success':
+                        console.log('Authenticated successfully');
+                        break;
+                        
+                    case 'UPDATE_SUCCESS':
+                        showNotification(data.message, 'success');
+                        // Redirect after successful update
+                        setTimeout(() => {
+                            window.location.href = 'products.php?msg=updated';
+                        }, 1500);
+                        break;
+                        
+                    case 'error':
+                        showNotification(data.message, 'warning');
+                        break;
+                        
+                    case 'pong':
+                        // Keep alive
+                        break;
+                        
+                    default:
+                        console.log('Unknown message type:', data.type);
+                }
+            };
+            
+            ws.onclose = function() {
+                console.log('❌ WebSocket Disconnected');
+                if(reconnectAttempts < 5) {
+                    reconnectAttempts++;
+                    setTimeout(connectWebSocket, 3000);
+                }
+            };
+        }
+        
+        // UPDATE PRODUCT via WebSocket
+        function updateProduct() {
+            const name = document.getElementById('productName').value;
+            const category_id = document.getElementById('categoryId').value;
+            const price = document.getElementById('productPrice').value;
+            const stock = document.getElementById('productStock').value;
+            const description = document.getElementById('productDescription').value;
+            const status = document.getElementById('productStatus').value;
+            const imageUrl = document.getElementById('productImageUrl').value;
+            const imageFile = document.getElementById('productImageFile').files[0];
+            
+            let image = '';
+            
+            // Handle file upload (simplified - for full upload, you'd need to upload via separate HTTP)
+            if(imageFile) {
+                // For file upload, we'd need a separate HTTP upload endpoint
+                // For now, use URL if provided
+                showNotification('File upload via WebSocket requires separate endpoint. Using URL if provided.', 'warning');
+            }
+            
+            // Use URL if provided, otherwise keep existing
+            if(imageUrl) {
+                image = imageUrl;
+            } else {
+                image = '<?php echo addslashes($product['image']); ?>';
+            }
+            
+            if(!name || !category_id || !price || !stock) {
+                showNotification('Please fill all required fields', 'warning');
+                return;
+            }
+            
+            if(ws && ws.readyState === WebSocket.OPEN) {
+                showLoading(true);
+                ws.send(JSON.stringify({
+                    type: 'UPDATE_PRODUCT',
+                    payload: {
+                        id: productId,
+                        name: name,
+                        category_id: parseInt(category_id),
+                        price: parseFloat(price),
+                        stock: parseInt(stock),
+                        description: description,
+                        status: status,
+                        image: image
+                    }
+                }));
+                showLoading(false);
+            } else {
+                showNotification('WebSocket not connected. Please refresh the page.', 'warning');
+            }
+        }
+        
         function previewImage(input) {
             var preview = document.getElementById('imagePreview');
             preview.innerHTML = '';
@@ -427,81 +506,6 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
                     preview.appendChild(img);
                 }
                 reader.readAsDataURL(input.files[0]);
-            }
-        }
-        
-        // ========== WEBSOCKET CLIENT ==========
-        let ws;
-        let reconnectAttempts = 0;
-        
-        function connectWebSocket() {
-            ws = new WebSocket('ws://localhost:8080');
-            
-            ws.onopen = function() {
-                console.log('✅ Connected to WebSocket');
-                reconnectAttempts = 0;
-                
-                // Authenticate
-                ws.send(JSON.stringify({
-                    type: 'auth',
-                    user_id: <?php echo $_SESSION['user_id']; ?>,
-                    role: '<?php echo $_SESSION['role']; ?>'
-                }));
-                
-                // Send ping every 30 seconds
-                setInterval(() => {
-                    if(ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ type: 'ping' }));
-                    }
-                }, 30000);
-            };
-            
-            ws.onmessage = function(event) {
-                const data = JSON.parse(event.data);
-                
-                switch(data.type) {
-                    case 'welcome':
-                        showNotification('Connected to real-time server', 'success');
-                        break;
-                        
-                    case 'crud':
-                        handleCRUDEvent(data);
-                        break;
-                        
-                    case 'pong':
-                        // Keep alive
-                        break;
-                }
-            };
-            
-            ws.onclose = function() {
-                console.log('❌ WebSocket Disconnected');
-                if(reconnectAttempts < 5) {
-                    reconnectAttempts++;
-                    setTimeout(connectWebSocket, 3000);
-                }
-            };
-        }
-        
-        function handleCRUDEvent(data) {
-            const { action, data: eventData } = data;
-            
-            switch(action) {
-                case 'product_added':
-                    showNotification(`🆕 New product: ${eventData.name} added by ${eventData.action_by}`, 'info');
-                    break;
-                    
-                case 'product_updated':
-                    showNotification(`✏️ Product updated: ${eventData.name}`, 'info');
-                    break;
-                    
-                case 'product_deleted':
-                    showNotification(`🗑️ Product deleted: ${eventData.name}`, 'warning');
-                    break;
-                    
-                case 'order_placed':
-                    showNotification(`📦 New order #${eventData.order_number} from ${eventData.username}`, 'success');
-                    break;
             }
         }
         
@@ -526,8 +530,24 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             }, 5000);
         }
         
-        // Connect WebSocket when page loads
-        document.addEventListener('DOMContentLoaded', connectWebSocket);
+        function showLoading(show) {
+            const overlay = document.getElementById('loadingOverlay');
+            if(overlay) {
+                overlay.style.display = show ? 'flex' : 'none';
+            }
+        }
+        
+        // Form submission handler
+        document.addEventListener('DOMContentLoaded', function() {
+            const form = document.getElementById('editProductForm');
+            if(form) {
+                form.addEventListener('submit', function(e) {
+                    e.preventDefault();
+                    updateProduct();
+                });
+            }
+            connectWebSocket();
+        });
     </script>
 </body>
 </html>

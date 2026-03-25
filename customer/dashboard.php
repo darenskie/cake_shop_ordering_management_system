@@ -1,7 +1,7 @@
 <?php
 session_start();
 require_once '../db.php';
-require_once '../websocket_client.php'; // ADD THIS LINE
+require_once '../websocket_client.php';
 
 if(!isset($_SESSION['user_id']) || $_SESSION['role'] != 'customer') {
     header("Location: ../login.php");
@@ -11,84 +11,12 @@ if(!isset($_SESSION['user_id']) || $_SESSION['role'] != 'customer') {
 // Generate unique token for idempotency (prevents duplicate orders)
 $order_token = md5(uniqid(rand(), true));
 
-// Get available products with images
-$products = $conn->query("
-    SELECT p.*, c.name as category_name 
-    FROM products p 
-    LEFT JOIN categories c ON p.category_id = c.id 
-    WHERE p.status = 'available' AND p.stock > 0
-    ORDER BY p.id DESC
-")->fetchAll();
-
-// Get customer's orders
+// Get customer's orders (still via HTTP for initial load)
 $my_orders = $conn->prepare("SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 5");
 $my_orders->execute([$_SESSION['user_id']]);
 $orders = $my_orders->fetchAll();
 
-// Handle place order with idempotency
-if(isset($_POST['place_order'])) {
-    $submitted_token = $_POST['order_token'];
-    $product_id = $_POST['product_id'];
-    $quantity = $_POST['quantity'];
-    $address = $_POST['address'];
-    
-    // Check if this order was already processed (idempotency)
-    $check = $conn->prepare("SELECT id FROM orders WHERE order_token = ?");
-    $check->execute([$submitted_token]);
-    
-    if($check->rowCount() == 0) {
-        // Get product price
-        $prod = $conn->prepare("SELECT price, name, stock FROM products WHERE id = ?");
-        $prod->execute([$product_id]);
-        $product = $prod->fetch();
-        
-        // Check if enough stock
-        if($product['stock'] >= $quantity) {
-            $total = $product['price'] * $quantity;
-            $order_number = 'ORD-' . date('Ymd') . '-' . rand(1000, 9999);
-            
-            // Create order
-            $stmt = $conn->prepare("INSERT INTO orders (user_id, order_number, total_amount, shipping_address, status, order_token) VALUES (?, ?, ?, ?, 'pending', ?)");
-            $stmt->execute([$_SESSION['user_id'], $order_number, $total, $address, $submitted_token]);
-            $order_id = $conn->lastInsertId();
-            
-            // Add order item
-            $item = $conn->prepare("INSERT INTO order_items (order_id, product_id, quantity, price, subtotal) VALUES (?, ?, ?, ?, ?)");
-            $item->execute([$order_id, $product_id, $quantity, $product['price'], $total]);
-            
-            // Update stock
-            $update = $conn->prepare("UPDATE products SET stock = stock - ? WHERE id = ?");
-            $update->execute([$quantity, $product_id]);
-            
-            // Log audit
-            $log = $conn->prepare("INSERT INTO audit_logs (user_id, action, table_name, record_id, details) VALUES (?, 'ORDER', 'orders', ?, ?)");
-            $log->execute([$_SESSION['user_id'], $order_id, "Placed order for " . $product['name']]);
-            
-            // ADD WEBSOCKET BROADCAST FOR ORDER PLACED
-            broadcastWebSocket('order_placed', [
-                'order_id' => $order_id,
-                'order_number' => $order_number,
-                'user_id' => $_SESSION['user_id'],
-                'username' => $_SESSION['full_name'],
-                'total_amount' => $total,
-                'quantity' => $quantity,
-                'product_name' => $product['name']
-            ]);
-            
-            $success = "Order placed successfully! Order number: $order_number";
-            
-            // Refresh to show updated stock
-            header("Location: dashboard.php?success=1&order=" . $order_number);
-            exit();
-        } else {
-            $error = "Not enough stock! Only " . $product['stock'] . " items available.";
-        }
-    } else {
-        $error = "This order has already been processed!";
-    }
-}
-
-// Check for success message from redirect
+// Handle success message from redirect
 if(isset($_GET['success'])) {
     $success = "Order placed successfully! Order number: " . htmlspecialchars($_GET['order']);
 }
@@ -369,6 +297,26 @@ if(isset($_GET['success'])) {
             to { transform: translateX(100%); opacity: 0; }
         }
         
+        /* Loading Overlay */
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 10000;
+        }
+        .loading-spinner {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            font-size: 18px;
+        }
+        
         @media (max-width: 768px) {
             .products-grid {
                 grid-template-columns: 1fr;
@@ -395,86 +343,26 @@ if(isset($_GET['success'])) {
             <div class="success">✅ <?php echo $success; ?></div>
         <?php endif; ?>
         
-        <?php if(isset($error)): ?>
-            <div class="error">❌ <?php echo $error; ?></div>
-        <?php endif; ?>
-        
         <div class="welcome">
             <h1>Welcome to Cake Shop! 🎂</h1>
             <p>Browse our delicious cakes and place your order in real-time.</p>
         </div>
         
         <h2 class="section-title">🍰 Available Cakes</h2>
-        <div class="products-grid">
-            <?php foreach($products as $product): ?>
-            <div class="product-card">
-                <div class="product-image-container">
-                    <?php 
-                    // Get the image URL - use the same logic as admin products
-                    $image_url = '';
-                    if(!empty($product['image'])) {
-                        if(filter_var($product['image'], FILTER_VALIDATE_URL)) {
-                            $image_url = $product['image'];
-                        } else {
-                            $image_path = '../' . $product['image'];
-                            if(file_exists($image_path)) {
-                                $image_url = '../' . $product['image'];
-                            }
-                        }
-                    }
-                    
-                    if($image_url): 
-                    ?>
-                        <img src="<?php echo htmlspecialchars($image_url); ?>" class="product-image" alt="<?php echo htmlspecialchars($product['name']); ?>">
-                    <?php else: ?>
-                        <div class="no-image">
-                            <?php
-                            // Show emoji based on product name
-                            $name = strtolower($product['name']);
-                            if(strpos($name, 'chocolate') !== false) echo '🍫';
-                            elseif(strpos($name, 'strawberry') !== false) echo '🍓';
-                            elseif(strpos($name, 'vanilla') !== false) echo '🍦';
-                            elseif(strpos($name, 'red velvet') !== false) echo '❤️';
-                            elseif(strpos($name, 'carrot') !== false) echo '🥕';
-                            elseif(strpos($name, 'cheese') !== false) echo '🧀';
-                            elseif(strpos($name, 'cupcake') !== false) echo '🧁';
-                            else echo '🍰';
-                            ?>
-                            <span><?php echo htmlspecialchars($product['name']); ?></span>
-                        </div>
-                    <?php endif; ?>
-                </div>
-                <div class="product-info">
-                    <div class="category"><?php echo htmlspecialchars($product['category_name'] ?? 'Cake'); ?></div>
-                    <h3><?php echo htmlspecialchars($product['name']); ?></h3>
-                    <div class="price">₱<?php echo number_format($product['price'], 2); ?></div>
-                    <div class="stock <?php echo $product['stock'] <= 5 ? 'out-of-stock' : ''; ?>">
-                        <?php if($product['stock'] > 0): ?>
-                            📦 In Stock: <?php echo $product['stock']; ?> left
-                        <?php else: ?>
-                            ❌ Out of Stock
-                        <?php endif; ?>
-                    </div>
-                    <button class="order-btn" onclick="openOrderModal(<?php echo $product['id']; ?>, '<?php echo addslashes($product['name']); ?>', <?php echo $product['price']; ?>, <?php echo $product['stock']; ?>)" 
-                            <?php echo $product['stock'] <= 0 ? 'disabled' : ''; ?>>
-                        <?php echo $product['stock'] > 0 ? '🛒 Order Now' : 'Sold Out'; ?>
-                    </button>
-                </div>
-            </div>
-            <?php endforeach; ?>
+        <div id="productsGrid" class="products-grid">
+            <div style="text-align: center; padding: 40px;">Loading products...</div>
         </div>
         
         <h2 class="section-title">📦 My Recent Orders</h2>
-         <table>
+        <table>
             <thead>
-                 <tr>
+                <tr>
                     <th>Order #</th>
                     <th>Total</th>
                     <th>Status</th>
                     <th>Date</th>
-                 </tr>
-            </thead>
-            <tbody>
+                </thead>
+            <tbody id="ordersTableBody">
                 <?php foreach($orders as $order): ?>
                  <tr>
                     <td><?php echo htmlspecialchars($order['order_number']); ?></td>
@@ -487,7 +375,7 @@ if(isset($_GET['success'])) {
                  <tr><td colspan="4" style="text-align:center; padding: 40px;">📭 No orders yet. Start shopping!</td></tr>
                 <?php endif; ?>
             </tbody>
-         </table>
+        </table>
     </div>
     
     <!-- Order Modal -->
@@ -495,10 +383,9 @@ if(isset($_GET['success'])) {
         <div class="modal-content">
             <span class="close" onclick="closeModal()">&times;</span>
             <h2>📝 Place Your Order</h2>
-            <form method="POST">
-                <input type="hidden" name="product_id" id="product_id">
-                <input type="hidden" name="place_order" value="1">
-                <input type="hidden" name="order_token" value="<?php echo $order_token; ?>">
+            <form id="orderForm">
+                <input type="hidden" id="product_id">
+                <input type="hidden" id="order_token" value="<?php echo $order_token; ?>">
                 
                 <label>🍰 Product</label>
                 <input type="text" id="product_name" readonly style="background:#f5f5f5;">
@@ -507,70 +394,29 @@ if(isset($_GET['success'])) {
                 <input type="text" id="product_price" readonly style="background:#f5f5f5;">
                 
                 <label>🔢 Quantity</label>
-                <input type="number" name="quantity" id="quantity" min="1" value="1" required onchange="updateTotal()">
+                <input type="number" id="quantity" min="1" value="1" required onchange="updateTotal()">
                 
                 <label>💵 Total Amount</label>
                 <input type="text" id="total_amount" readonly style="background:#f5f5f5; font-weight:bold; color:#ff6b6b;">
                 
                 <label>📍 Shipping Address</label>
-                <textarea name="address" rows="3" placeholder="Enter your complete address" required></textarea>
+                <textarea id="address" rows="3" placeholder="Enter your complete address" required></textarea>
                 
                 <button type="submit" class="order-btn" style="margin-top:15px;">✅ Confirm Order</button>
             </form>
         </div>
     </div>
     
+    <!-- Loading Overlay -->
+    <div id="loadingOverlay" class="loading-overlay">
+        <div class="loading-spinner">⏳ Processing your order...</div>
+    </div>
+    
     <script>
+        let currentProductId = 0;
         let currentPrice = 0;
         let currentStock = 0;
-        
-        function openOrderModal(id, name, price, stock) {
-            currentPrice = price;
-            currentStock = stock;
-            document.getElementById('product_id').value = id;
-            document.getElementById('product_name').value = name;
-            document.getElementById('product_price').value = '₱' + price.toFixed(2);
-            document.getElementById('quantity').value = 1;
-            document.getElementById('quantity').max = stock;
-            document.getElementById('total_amount').value = '₱' + price.toFixed(2);
-            document.getElementById('orderModal').style.display = 'block';
-        }
-        
-        function closeModal() {
-            document.getElementById('orderModal').style.display = 'none';
-        }
-        
-        function updateTotal() {
-            const quantity = document.getElementById('quantity').value;
-            const total = currentPrice * quantity;
-            document.getElementById('total_amount').value = '₱' + total.toFixed(2);
-            
-            // Validate quantity
-            if(quantity > currentStock) {
-                alert('Only ' + currentStock + ' items available in stock!');
-                document.getElementById('quantity').value = currentStock;
-                updateTotal();
-            }
-        }
-        
-        window.onclick = function(event) {
-            const modal = document.getElementById('orderModal');
-            if (event.target == modal) {
-                closeModal();
-            }
-        };
-        
-        // Auto-hide success/error message after 5 seconds
-        setTimeout(function() {
-            const success = document.querySelector('.success');
-            const error = document.querySelector('.error');
-            if(success) {
-                success.style.display = 'none';
-            }
-            if(error) {
-                error.style.display = 'none';
-            }
-        }, 5000);
+        let currentProductName = '';
         
         // ========== WEBSOCKET CLIENT ==========
         let ws;
@@ -582,12 +428,14 @@ if(isset($_GET['success'])) {
             ws.onopen = function() {
                 console.log('✅ Connected to WebSocket');
                 reconnectAttempts = 0;
+                showNotification('Connected to real-time server', 'success');
                 
                 // Authenticate
                 ws.send(JSON.stringify({
                     type: 'auth',
                     user_id: <?php echo $_SESSION['user_id']; ?>,
-                    role: '<?php echo $_SESSION['role']; ?>'
+                    role: '<?php echo $_SESSION['role']; ?>',
+                    username: '<?php echo $_SESSION['username']; ?>'
                 }));
                 
                 // Send ping every 30 seconds
@@ -600,19 +448,57 @@ if(isset($_GET['success'])) {
             
             ws.onmessage = function(event) {
                 const data = JSON.parse(event.data);
+                console.log('📨 Message received:', data.type);
                 
                 switch(data.type) {
                     case 'welcome':
-                        showNotification('Connected to real-time server', 'success');
+                        showNotification(data.message, 'success');
                         break;
                         
-                    case 'crud':
-                        handleCRUDEvent(data);
+                    case 'auth_success':
+                        console.log('Authenticated successfully');
+                        // Refresh products after authentication
+                        refreshProducts();
+                        break;
+                        
+                    case 'PRODUCT_LIST':
+                        displayProducts(data.payload);
+                        break;
+                        
+                    case 'PRODUCT_CREATED':
+                        showNotification(`🆕 New product available: ${data.payload.name}`, 'info');
+                        refreshProducts();
+                        break;
+                        
+                    case 'PRODUCT_UPDATED':
+                        showNotification(`✏️ Product updated: ${data.payload.name}`, 'info');
+                        refreshProducts();
+                        break;
+                        
+                    case 'PRODUCT_DELETED':
+                        showNotification(`🗑️ Product removed: ${data.payload.name}`, 'warning');
+                        refreshProducts();
+                        break;
+                        
+                    case 'ORDER_SUCCESS':
+                        showNotification(`✅ ${data.message} - Order #${data.order_number}`, 'success');
+                        closeModal();
+                        // Refresh orders
+                        setTimeout(() => location.reload(), 1500);
+                        break;
+                        
+                    case 'ORDER_CREATED':
+                        if(data.payload.username !== '<?php echo $_SESSION['username']; ?>') {
+                            showNotification(`📦 New order placed by ${data.payload.username}`, 'success');
+                        }
                         break;
                         
                     case 'pong':
                         // Keep alive
                         break;
+                        
+                    default:
+                        console.log('Unknown message type:', data.type);
                 }
             };
             
@@ -625,31 +511,153 @@ if(isset($_GET['success'])) {
             };
         }
         
-        function handleCRUDEvent(data) {
-            const { action, data: eventData } = data;
+        function refreshProducts() {
+            if(ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'READ_PRODUCTS',
+                    payload: {}
+                }));
+            }
+        }
+        
+        function displayProducts(products) {
+            const grid = document.getElementById('productsGrid');
+            if(!grid) return;
             
-            switch(action) {
-                case 'product_added':
-                    showNotification(`🆕 New product available: ${eventData.name}`, 'info');
-                    // Refresh product list
-                    setTimeout(() => location.reload(), 2000);
-                    break;
-                    
-                case 'product_updated':
-                    showNotification(`✏️ Product updated: ${eventData.name}`, 'info');
-                    setTimeout(() => location.reload(), 2000);
-                    break;
-                    
-                case 'product_deleted':
-                    showNotification(`🗑️ Product removed: ${eventData.name}`, 'warning');
-                    setTimeout(() => location.reload(), 2000);
-                    break;
-                    
-                case 'order_placed':
-                    if(eventData.username !== '<?php echo $_SESSION['full_name']; ?>') {
-                        showNotification(`📦 New order placed by ${eventData.username}`, 'success');
+            if(products.length === 0) {
+                grid.innerHTML = '<div style="text-align: center; padding: 40px;">🍰 No products available.</div>';
+                return;
+            }
+            
+            let html = '';
+            products.forEach(product => {
+                // Only show available products with stock
+                if(product.status !== 'available' || product.stock <= 0) return;
+                
+                let imageHtml = '';
+                if(product.image) {
+                    if(product.image.startsWith('http')) {
+                        imageHtml = `<img src="${escapeHtml(product.image)}" class="product-image" alt="${escapeHtml(product.name)}">`;
+                    } else {
+                        imageHtml = `<img src="../${escapeHtml(product.image)}" class="product-image" alt="${escapeHtml(product.name)}">`;
                     }
-                    break;
+                } else {
+                    // Show emoji based on product name
+                    let emoji = '🍰';
+                    const name = product.name.toLowerCase();
+                    if(name.includes('chocolate')) emoji = '🍫';
+                    else if(name.includes('strawberry')) emoji = '🍓';
+                    else if(name.includes('vanilla')) emoji = '🍦';
+                    else if(name.includes('red velvet')) emoji = '❤️';
+                    else if(name.includes('carrot')) emoji = '🥕';
+                    else if(name.includes('cheese')) emoji = '🧀';
+                    else if(name.includes('cupcake')) emoji = '🧁';
+                    
+                    imageHtml = `<div class="no-image">${emoji}<span>${escapeHtml(product.name)}</span></div>`;
+                }
+                
+                html += `
+                    <div class="product-card">
+                        <div class="product-image-container">
+                            ${imageHtml}
+                        </div>
+                        <div class="product-info">
+                            <div class="category">${escapeHtml(product.category_name || 'Cake')}</div>
+                            <h3>${escapeHtml(product.name)}</h3>
+                            <div class="price">₱${parseFloat(product.price).toFixed(2)}</div>
+                            <div class="stock ${product.stock <= 5 ? 'out-of-stock' : ''}">
+                                📦 In Stock: ${product.stock} left
+                            </div>
+                            <button class="order-btn" onclick="openOrderModal(${product.id}, '${escapeHtml(product.name)}', ${product.price}, ${product.stock})">
+                                🛒 Order Now
+                            </button>
+                        </div>
+                    </div>
+                `;
+            });
+            
+            if(html === '') {
+                grid.innerHTML = '<div style="text-align: center; padding: 40px;">🍰 No products available.</div>';
+            } else {
+                grid.innerHTML = html;
+            }
+        }
+        
+        function escapeHtml(str) {
+            if(!str) return '';
+            return str.replace(/[&<>]/g, function(m) {
+                if(m === '&') return '&amp;';
+                if(m === '<') return '&lt;';
+                if(m === '>') return '&gt;';
+                return m;
+            });
+        }
+        
+        // CREATE ORDER via WebSocket
+        function placeOrder() {
+            const product_id = currentProductId;
+            const quantity = parseInt(document.getElementById('quantity').value);
+            const address = document.getElementById('address').value;
+            const order_token = document.getElementById('order_token').value;
+            
+            if(!address) {
+                showNotification('Please enter your shipping address', 'warning');
+                return;
+            }
+            
+            if(quantity > currentStock) {
+                showNotification(`Only ${currentStock} items available!`, 'warning');
+                return;
+            }
+            
+            if(ws && ws.readyState === WebSocket.OPEN) {
+                showLoading(true);
+                ws.send(JSON.stringify({
+                    type: 'CREATE_ORDER',
+                    payload: {
+                        user_id: <?php echo $_SESSION['user_id']; ?>,
+                        product_id: product_id,
+                        quantity: quantity,
+                        address: address,
+                        order_token: order_token
+                    }
+                }));
+                showLoading(false);
+            } else {
+                showNotification('WebSocket not connected. Please refresh the page.', 'warning');
+            }
+        }
+        
+        function openOrderModal(id, name, price, stock) {
+            currentProductId = id;
+            currentPrice = price;
+            currentStock = stock;
+            currentProductName = name;
+            
+            document.getElementById('product_id').value = id;
+            document.getElementById('product_name').value = name;
+            document.getElementById('product_price').value = '₱' + price.toFixed(2);
+            document.getElementById('quantity').value = 1;
+            document.getElementById('quantity').max = stock;
+            document.getElementById('total_amount').value = '₱' + price.toFixed(2);
+            document.getElementById('address').value = '';
+            document.getElementById('orderModal').style.display = 'block';
+        }
+        
+        function closeModal() {
+            document.getElementById('orderModal').style.display = 'none';
+            currentProductId = 0;
+        }
+        
+        function updateTotal() {
+            const quantity = parseInt(document.getElementById('quantity').value) || 1;
+            const total = currentPrice * quantity;
+            document.getElementById('total_amount').value = '₱' + total.toFixed(2);
+            
+            if(quantity > currentStock) {
+                showNotification(`Only ${currentStock} items available!`, 'warning');
+                document.getElementById('quantity').value = currentStock;
+                updateTotal();
             }
         }
         
@@ -674,8 +682,39 @@ if(isset($_GET['success'])) {
             }, 5000);
         }
         
-        // Connect WebSocket when page loads
-        document.addEventListener('DOMContentLoaded', connectWebSocket);
+        function showLoading(show) {
+            const overlay = document.getElementById('loadingOverlay');
+            if(overlay) {
+                overlay.style.display = show ? 'flex' : 'none';
+            }
+        }
+        
+        // Auto-hide success/error message after 5 seconds
+        setTimeout(function() {
+            const success = document.querySelector('.success');
+            const error = document.querySelector('.error');
+            if(success) success.style.display = 'none';
+            if(error) error.style.display = 'none';
+        }, 5000);
+        
+        window.onclick = function(event) {
+            const modal = document.getElementById('orderModal');
+            if (event.target == modal) {
+                closeModal();
+            }
+        };
+        
+        // Form submission handler
+        document.addEventListener('DOMContentLoaded', function() {
+            const form = document.getElementById('orderForm');
+            if(form) {
+                form.addEventListener('submit', function(e) {
+                    e.preventDefault();
+                    placeOrder();
+                });
+            }
+            connectWebSocket();
+        });
     </script>
 </body>
 </html>

@@ -1,0 +1,15 @@
+* [33m4033602[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m Add WebSocket real-time broadcasting for CRUD operations
+* [33m2a28688[m Update style.css with design improvements
+* [33mc2cabcc[m Update admin and customer dashboards with product images
+* [33me4370a6[m Update products.php with new features
+* [33m42730a6[m Apply responsive Bootstrap styling and custom cake shop theme
+* [33m2b8f0ae[m Implement customer frontend and cake selection interface
+* [33m557ef09[m Develop secure admin panel for order tracking and user control
+* [33m4fcc9ef[m Initialize vendor module and product management dashboard
+* [33m4585cc0[m Initial commit
+* [33ma6f5e28[m Initial commit
+* [33m3bb5a17[m Initial commit
+* [33m8d525cb[m Add complete admin panel for Cake Shop system
+* [33mbf3389c[m delete index.php
+* [33mfbe7fbe[m Add test index.php page
+* [33m3a3e9c2[m Initial commit
