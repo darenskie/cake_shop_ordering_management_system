@@ -1,11 +1,15 @@
 <?php
 session_start();
 require_once '../db.php';
+require_once '../websocket_client.php'; // ADD THIS LINE
 
 if(!isset($_SESSION['user_id']) || $_SESSION['role'] != 'customer') {
     header("Location: ../login.php");
     exit();
 }
+
+// Generate unique token for idempotency (prevents duplicate orders)
+$order_token = md5(uniqid(rand(), true));
 
 // Get available products with images
 $products = $conn->query("
@@ -21,38 +25,72 @@ $my_orders = $conn->prepare("SELECT * FROM orders WHERE user_id = ? ORDER BY id 
 $my_orders->execute([$_SESSION['user_id']]);
 $orders = $my_orders->fetchAll();
 
-// Handle place order
+// Handle place order with idempotency
 if(isset($_POST['place_order'])) {
+    $submitted_token = $_POST['order_token'];
     $product_id = $_POST['product_id'];
     $quantity = $_POST['quantity'];
     $address = $_POST['address'];
     
-    // Get product price
-    $prod = $conn->prepare("SELECT price, name FROM products WHERE id = ?");
-    $prod->execute([$product_id]);
-    $product = $prod->fetch();
+    // Check if this order was already processed (idempotency)
+    $check = $conn->prepare("SELECT id FROM orders WHERE order_token = ?");
+    $check->execute([$submitted_token]);
     
-    $total = $product['price'] * $quantity;
-    $order_number = 'ORD-' . date('Ymd') . '-' . rand(1000, 9999);
-    
-    // Create order
-    $stmt = $conn->prepare("INSERT INTO orders (user_id, order_number, total_amount, shipping_address, status) VALUES (?, ?, ?, ?, 'pending')");
-    $stmt->execute([$_SESSION['user_id'], $order_number, $total, $address]);
-    $order_id = $conn->lastInsertId();
-    
-    // Add order item
-    $item = $conn->prepare("INSERT INTO order_items (order_id, product_id, quantity, price, subtotal) VALUES (?, ?, ?, ?, ?)");
-    $item->execute([$order_id, $product_id, $quantity, $product['price'], $total]);
-    
-    // Update stock
-    $update = $conn->prepare("UPDATE products SET stock = stock - ? WHERE id = ?");
-    $update->execute([$quantity, $product_id]);
-    
-    // Log audit
-    $log = $conn->prepare("INSERT INTO audit_logs (user_id, action, table_name, record_id, details) VALUES (?, 'ORDER', 'orders', ?, ?)");
-    $log->execute([$_SESSION['user_id'], $order_id, "Placed order for " . $product['name']]);
-    
-    $success = "Order placed successfully! Order number: $order_number";
+    if($check->rowCount() == 0) {
+        // Get product price
+        $prod = $conn->prepare("SELECT price, name, stock FROM products WHERE id = ?");
+        $prod->execute([$product_id]);
+        $product = $prod->fetch();
+        
+        // Check if enough stock
+        if($product['stock'] >= $quantity) {
+            $total = $product['price'] * $quantity;
+            $order_number = 'ORD-' . date('Ymd') . '-' . rand(1000, 9999);
+            
+            // Create order
+            $stmt = $conn->prepare("INSERT INTO orders (user_id, order_number, total_amount, shipping_address, status, order_token) VALUES (?, ?, ?, ?, 'pending', ?)");
+            $stmt->execute([$_SESSION['user_id'], $order_number, $total, $address, $submitted_token]);
+            $order_id = $conn->lastInsertId();
+            
+            // Add order item
+            $item = $conn->prepare("INSERT INTO order_items (order_id, product_id, quantity, price, subtotal) VALUES (?, ?, ?, ?, ?)");
+            $item->execute([$order_id, $product_id, $quantity, $product['price'], $total]);
+            
+            // Update stock
+            $update = $conn->prepare("UPDATE products SET stock = stock - ? WHERE id = ?");
+            $update->execute([$quantity, $product_id]);
+            
+            // Log audit
+            $log = $conn->prepare("INSERT INTO audit_logs (user_id, action, table_name, record_id, details) VALUES (?, 'ORDER', 'orders', ?, ?)");
+            $log->execute([$_SESSION['user_id'], $order_id, "Placed order for " . $product['name']]);
+            
+            // ADD WEBSOCKET BROADCAST FOR ORDER PLACED
+            broadcastWebSocket('order_placed', [
+                'order_id' => $order_id,
+                'order_number' => $order_number,
+                'user_id' => $_SESSION['user_id'],
+                'username' => $_SESSION['full_name'],
+                'total_amount' => $total,
+                'quantity' => $quantity,
+                'product_name' => $product['name']
+            ]);
+            
+            $success = "Order placed successfully! Order number: $order_number";
+            
+            // Refresh to show updated stock
+            header("Location: dashboard.php?success=1&order=" . $order_number);
+            exit();
+        } else {
+            $error = "Not enough stock! Only " . $product['stock'] . " items available.";
+        }
+    } else {
+        $error = "This order has already been processed!";
+    }
+}
+
+// Check for success message from redirect
+if(isset($_GET['success'])) {
+    $success = "Order placed successfully! Order number: " . htmlspecialchars($_GET['order']);
 }
 ?>
 <!DOCTYPE html>
@@ -283,6 +321,54 @@ if(isset($_POST['place_order'])) {
             border-left: 4px solid #28a745;
             animation: slideDown 0.3s;
         }
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border-left: 4px solid #dc3545;
+            animation: slideDown 0.3s;
+        }
+        
+        /* Notification Styles */
+        .notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 9999;
+            animation: slideIn 0.3s ease;
+        }
+        .notification-content {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            padding: 12px 20px;
+            min-width: 250px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .notification-success { border-left: 4px solid #28a745; }
+        .notification-info { border-left: 4px solid #17a2b8; }
+        .notification-warning { border-left: 4px solid #ffc107; }
+        .notification-close {
+            margin-left: auto;
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 18px;
+            color: #999;
+        }
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        @keyframes slideOut {
+            from { transform: translateX(0); opacity: 1; }
+            to { transform: translateX(100%); opacity: 0; }
+        }
+        
         @media (max-width: 768px) {
             .products-grid {
                 grid-template-columns: 1fr;
@@ -307,6 +393,10 @@ if(isset($_POST['place_order'])) {
     <div class="container">
         <?php if(isset($success)): ?>
             <div class="success">✅ <?php echo $success; ?></div>
+        <?php endif; ?>
+        
+        <?php if(isset($error)): ?>
+            <div class="error">❌ <?php echo $error; ?></div>
         <?php endif; ?>
         
         <div class="welcome">
@@ -375,29 +465,29 @@ if(isset($_POST['place_order'])) {
         </div>
         
         <h2 class="section-title">📦 My Recent Orders</h2>
-        <table>
+         <table>
             <thead>
-                <tr>
+                 <tr>
                     <th>Order #</th>
                     <th>Total</th>
                     <th>Status</th>
                     <th>Date</th>
-                </tr>
+                 </tr>
             </thead>
             <tbody>
                 <?php foreach($orders as $order): ?>
-                <tr>
+                 <tr>
                     <td><?php echo htmlspecialchars($order['order_number']); ?></td>
                     <td>₱<?php echo number_format($order['total_amount'], 2); ?></td>
                     <td><span class="badge <?php echo $order['status']; ?>"><?php echo ucfirst($order['status']); ?></span></td>
                     <td><?php echo date('M d, Y', strtotime($order['created_at'])); ?></td>
-                </tr>
+                 </tr>
                 <?php endforeach; ?>
                 <?php if(empty($orders)): ?>
-                <tr><td colspan="4" style="text-align:center; padding: 40px;">📭 No orders yet. Start shopping!</td></tr>
+                 <tr><td colspan="4" style="text-align:center; padding: 40px;">📭 No orders yet. Start shopping!</td></tr>
                 <?php endif; ?>
             </tbody>
-        </table>
+         </table>
     </div>
     
     <!-- Order Modal -->
@@ -408,6 +498,7 @@ if(isset($_POST['place_order'])) {
             <form method="POST">
                 <input type="hidden" name="product_id" id="product_id">
                 <input type="hidden" name="place_order" value="1">
+                <input type="hidden" name="order_token" value="<?php echo $order_token; ?>">
                 
                 <label>🍰 Product</label>
                 <input type="text" id="product_name" readonly style="background:#f5f5f5;">
@@ -469,13 +560,122 @@ if(isset($_POST['place_order'])) {
             }
         };
         
-        // Auto-hide success message
+        // Auto-hide success/error message after 5 seconds
         setTimeout(function() {
             const success = document.querySelector('.success');
+            const error = document.querySelector('.error');
             if(success) {
                 success.style.display = 'none';
             }
+            if(error) {
+                error.style.display = 'none';
+            }
         }, 5000);
+        
+        // ========== WEBSOCKET CLIENT ==========
+        let ws;
+        let reconnectAttempts = 0;
+        
+        function connectWebSocket() {
+            ws = new WebSocket('ws://localhost:8080');
+            
+            ws.onopen = function() {
+                console.log('✅ Connected to WebSocket');
+                reconnectAttempts = 0;
+                
+                // Authenticate
+                ws.send(JSON.stringify({
+                    type: 'auth',
+                    user_id: <?php echo $_SESSION['user_id']; ?>,
+                    role: '<?php echo $_SESSION['role']; ?>'
+                }));
+                
+                // Send ping every 30 seconds
+                setInterval(() => {
+                    if(ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'ping' }));
+                    }
+                }, 30000);
+            };
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                
+                switch(data.type) {
+                    case 'welcome':
+                        showNotification('Connected to real-time server', 'success');
+                        break;
+                        
+                    case 'crud':
+                        handleCRUDEvent(data);
+                        break;
+                        
+                    case 'pong':
+                        // Keep alive
+                        break;
+                }
+            };
+            
+            ws.onclose = function() {
+                console.log('❌ WebSocket Disconnected');
+                if(reconnectAttempts < 5) {
+                    reconnectAttempts++;
+                    setTimeout(connectWebSocket, 3000);
+                }
+            };
+        }
+        
+        function handleCRUDEvent(data) {
+            const { action, data: eventData } = data;
+            
+            switch(action) {
+                case 'product_added':
+                    showNotification(`🆕 New product available: ${eventData.name}`, 'info');
+                    // Refresh product list
+                    setTimeout(() => location.reload(), 2000);
+                    break;
+                    
+                case 'product_updated':
+                    showNotification(`✏️ Product updated: ${eventData.name}`, 'info');
+                    setTimeout(() => location.reload(), 2000);
+                    break;
+                    
+                case 'product_deleted':
+                    showNotification(`🗑️ Product removed: ${eventData.name}`, 'warning');
+                    setTimeout(() => location.reload(), 2000);
+                    break;
+                    
+                case 'order_placed':
+                    if(eventData.username !== '<?php echo $_SESSION['full_name']; ?>') {
+                        showNotification(`📦 New order placed by ${eventData.username}`, 'success');
+                    }
+                    break;
+            }
+        }
+        
+        function showNotification(message, type = 'info') {
+            const notification = document.createElement('div');
+            notification.className = `notification notification-${type}`;
+            notification.innerHTML = `
+                <div class="notification-content notification-${type}">
+                    <span>${type === 'success' ? '✅' : type === 'warning' ? '⚠️' : '🔔'}</span>
+                    <span>${message}</span>
+                    <button class="notification-close" onclick="this.parentElement.parentElement.remove()">×</button>
+                </div>
+            `;
+            
+            document.body.appendChild(notification);
+            
+            setTimeout(() => {
+                if(notification.parentElement) {
+                    notification.style.animation = 'slideOut 0.3s ease';
+                    setTimeout(() => notification.remove(), 300);
+                }
+            }, 5000);
+        }
+        
+        // Connect WebSocket when page loads
+        document.addEventListener('DOMContentLoaded', connectWebSocket);
     </script>
 </body>
 </html>

@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once '../db.php';
+require_once '../websocket_client.php'; // ADD THIS LINE
 
 if(!isset($_SESSION['user_id']) || $_SESSION['role'] != 'admin') {
     header("Location: ../login.php");
@@ -74,6 +75,18 @@ if(isset($_POST['update_product'])) {
     $log = $conn->prepare("INSERT INTO audit_logs (user_id, action, table_name, record_id, details) VALUES (?, 'UPDATE', 'products', ?, ?)");
     $log->execute([$_SESSION['user_id'], $product_id, "Updated product: $name"]);
     
+    // ADD WEBSOCKET BROADCAST FOR PRODUCT UPDATED
+    broadcastWebSocket('product_updated', [
+        'id' => $product_id,
+        'name' => $name,
+        'price' => $price,
+        'stock' => $stock,
+        'status' => $status,
+        'image' => $image,
+        'category_id' => $category_id,
+        'action_by' => $_SESSION['full_name']
+    ]);
+    
     header("Location: products.php?msg=updated");
     exit();
 }
@@ -97,6 +110,7 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             padding: 20px;
             position: fixed;
             height: 100vh;
+            overflow-y: auto;
         }
         .sidebar h2 { margin-bottom: 20px; }
         .sidebar h2 span { color: #ff6b6b; }
@@ -107,6 +121,7 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             padding: 10px;
             margin: 5px 0;
             border-radius: 5px;
+            transition: background 0.3s;
         }
         .sidebar a:hover {
             background: #34495e;
@@ -160,15 +175,23 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
         }
         .current-image {
             margin: 10px 0;
-            padding: 10px;
+            padding: 15px;
             background: #f8f9fa;
-            border-radius: 5px;
+            border-radius: 8px;
             text-align: center;
+            border: 1px solid #e0e0e0;
         }
         .current-image img {
             max-width: 150px;
             max-height: 150px;
             border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .current-image p {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #666;
+            word-break: break-all;
         }
         .btn {
             padding: 12px 24px;
@@ -178,6 +201,8 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             font-size: 14px;
             font-weight: 600;
             transition: opacity 0.3s;
+            text-decoration: none;
+            display: inline-block;
         }
         .btn-primary {
             background: #ff6b6b;
@@ -186,8 +211,6 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
         .btn-secondary {
             background: #6c757d;
             color: white;
-            text-decoration: none;
-            display: inline-block;
         }
         .btn:hover {
             opacity: 0.8;
@@ -202,12 +225,58 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             max-height: 150px;
             margin-top: 10px;
             border-radius: 5px;
+            border: 1px solid #ddd;
+            padding: 5px;
         }
         .help-text {
             font-size: 12px;
             color: #666;
             margin-top: 5px;
         }
+        hr {
+            margin: 20px 0;
+            border: none;
+            border-top: 1px solid #eee;
+        }
+        
+        /* Notification Styles */
+        .notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 9999;
+            animation: slideIn 0.3s ease;
+        }
+        .notification-content {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            padding: 12px 20px;
+            min-width: 250px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .notification-success { border-left: 4px solid #28a745; }
+        .notification-info { border-left: 4px solid #17a2b8; }
+        .notification-warning { border-left: 4px solid #ffc107; }
+        .notification-close {
+            margin-left: auto;
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 18px;
+            color: #999;
+        }
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        @keyframes slideOut {
+            from { transform: translateX(0); opacity: 1; }
+            to { transform: translateX(100%); opacity: 0; }
+        }
+        
         @media (max-width: 768px) {
             .sidebar {
                 width: 200px;
@@ -294,27 +363,39 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
                             <?php if(!empty($product['image'])): ?>
                                 <?php if(filter_var($product['image'], FILTER_VALIDATE_URL)): ?>
                                     <img src="<?php echo $product['image']; ?>" alt="<?php echo $product['name']; ?>">
+                                    <p>Image URL: <?php echo htmlspecialchars($product['image']); ?></p>
                                 <?php else: ?>
-                                    <img src="../<?php echo $product['image']; ?>" alt="<?php echo $product['name']; ?>">
+                                    <?php 
+                                    $image_path = '../' . $product['image'];
+                                    if(file_exists($image_path)): 
+                                    ?>
+                                        <img src="../<?php echo $product['image']; ?>" alt="<?php echo $product['name']; ?>">
+                                        <p>Image Path: <?php echo htmlspecialchars($product['image']); ?></p>
+                                    <?php else: ?>
+                                        <div style="padding: 40px; background: #f0f0f0; border-radius: 8px;">⚠️ Image file not found</div>
+                                        <p><?php echo htmlspecialchars($product['image']); ?></p>
+                                    <?php endif; ?>
                                 <?php endif; ?>
-                                <p class="help-text">Current image URL: <?php echo htmlspecialchars($product['image']); ?></p>
                             <?php else: ?>
                                 <div style="padding: 40px; background: #f0f0f0; border-radius: 8px;">🍰 No image set</div>
                             <?php endif; ?>
                         </div>
                     </div>
                     
+                    <hr>
+                    
                     <div class="form-group">
-                        <label>Upload New Image</label>
+                        <label>📁 Upload New Image</label>
                         <input type="file" name="image" accept="image/*" onchange="previewImage(this)">
-                        <p class="help-text">Allowed: JPG, JPEG, PNG, GIF. Max size: 2MB</p>
+                        <p class="help-text">Allowed: JPG, JPEG, PNG, GIF. Leave empty to keep current image.</p>
                         <div id="imagePreview"></div>
                     </div>
                     
                     <div class="form-group">
-                        <label>OR Enter Image URL</label>
-                        <input type="text" name="image_url" placeholder="https://example.com/image.jpg" value="<?php echo filter_var($product['image'], FILTER_VALIDATE_URL) ? $product['image'] : ''; ?>">
-                        <p class="help-text">Paste a direct link to an image from the web</p>
+                        <label>🔗 OR Enter Image URL</label>
+                        <input type="text" name="image_url" placeholder="https://example.com/cake-image.jpg" 
+                               value="<?php echo filter_var($product['image'], FILTER_VALIDATE_URL) ? $product['image'] : ''; ?>">
+                        <p class="help-text">Paste a direct link to an image from the web (e.g., from Pexels, Unsplash)</p>
                     </div>
                     
                     <div class="button-group">
@@ -348,6 +429,105 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
                 reader.readAsDataURL(input.files[0]);
             }
         }
+        
+        // ========== WEBSOCKET CLIENT ==========
+        let ws;
+        let reconnectAttempts = 0;
+        
+        function connectWebSocket() {
+            ws = new WebSocket('ws://localhost:8080');
+            
+            ws.onopen = function() {
+                console.log('✅ Connected to WebSocket');
+                reconnectAttempts = 0;
+                
+                // Authenticate
+                ws.send(JSON.stringify({
+                    type: 'auth',
+                    user_id: <?php echo $_SESSION['user_id']; ?>,
+                    role: '<?php echo $_SESSION['role']; ?>'
+                }));
+                
+                // Send ping every 30 seconds
+                setInterval(() => {
+                    if(ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'ping' }));
+                    }
+                }, 30000);
+            };
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                
+                switch(data.type) {
+                    case 'welcome':
+                        showNotification('Connected to real-time server', 'success');
+                        break;
+                        
+                    case 'crud':
+                        handleCRUDEvent(data);
+                        break;
+                        
+                    case 'pong':
+                        // Keep alive
+                        break;
+                }
+            };
+            
+            ws.onclose = function() {
+                console.log('❌ WebSocket Disconnected');
+                if(reconnectAttempts < 5) {
+                    reconnectAttempts++;
+                    setTimeout(connectWebSocket, 3000);
+                }
+            };
+        }
+        
+        function handleCRUDEvent(data) {
+            const { action, data: eventData } = data;
+            
+            switch(action) {
+                case 'product_added':
+                    showNotification(`🆕 New product: ${eventData.name} added by ${eventData.action_by}`, 'info');
+                    break;
+                    
+                case 'product_updated':
+                    showNotification(`✏️ Product updated: ${eventData.name}`, 'info');
+                    break;
+                    
+                case 'product_deleted':
+                    showNotification(`🗑️ Product deleted: ${eventData.name}`, 'warning');
+                    break;
+                    
+                case 'order_placed':
+                    showNotification(`📦 New order #${eventData.order_number} from ${eventData.username}`, 'success');
+                    break;
+            }
+        }
+        
+        function showNotification(message, type = 'info') {
+            const notification = document.createElement('div');
+            notification.className = `notification notification-${type}`;
+            notification.innerHTML = `
+                <div class="notification-content notification-${type}">
+                    <span>${type === 'success' ? '✅' : type === 'warning' ? '⚠️' : '🔔'}</span>
+                    <span>${message}</span>
+                    <button class="notification-close" onclick="this.parentElement.parentElement.remove()">×</button>
+                </div>
+            `;
+            
+            document.body.appendChild(notification);
+            
+            setTimeout(() => {
+                if(notification.parentElement) {
+                    notification.style.animation = 'slideOut 0.3s ease';
+                    setTimeout(() => notification.remove(), 300);
+                }
+            }, 5000);
+        }
+        
+        // Connect WebSocket when page loads
+        document.addEventListener('DOMContentLoaded', connectWebSocket);
     </script>
 </body>
 </html>

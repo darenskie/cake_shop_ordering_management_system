@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once '../db.php';
+require_once '../websocket_client.php'; // ADD THIS LINE
 
 if(!isset($_SESSION['user_id']) || $_SESSION['role'] != 'admin') {
     header("Location: ../login.php");
@@ -41,10 +42,22 @@ if(isset($_POST['add_product'])) {
     
     $stmt = $conn->prepare("INSERT INTO products (name, category_id, price, stock, description, image, status) VALUES (?, ?, ?, ?, ?, ?, 'available')");
     $stmt->execute([$name, $category_id, $price, $stock, $description, $image]);
+    $new_id = $conn->lastInsertId();
     
     // Log audit
     $log = $conn->prepare("INSERT INTO audit_logs (user_id, action, table_name, record_id, details) VALUES (?, 'CREATE', 'products', ?, ?)");
-    $log->execute([$_SESSION['user_id'], $conn->lastInsertId(), "Added product: $name"]);
+    $log->execute([$_SESSION['user_id'], $new_id, "Added product: $name"]);
+    
+    // ADD WEBSOCKET BROADCAST FOR PRODUCT ADDED
+    broadcastWebSocket('product_added', [
+        'id' => $new_id,
+        'name' => $name,
+        'price' => $price,
+        'stock' => $stock,
+        'image' => $image,
+        'category_id' => $category_id,
+        'action_by' => $_SESSION['full_name']
+    ]);
     
     header("Location: products.php?msg=added");
     exit();
@@ -58,6 +71,7 @@ if(isset($_GET['delete'])) {
     $prod = $conn->prepare("SELECT name, image FROM products WHERE id = ?");
     $prod->execute([$id]);
     $product = $prod->fetch();
+    $product_name = $product['name'] ?? 'Unknown';
     
     // Delete image file if exists and is local file
     if($product && $product['image'] && !filter_var($product['image'], FILTER_VALIDATE_URL)) {
@@ -72,7 +86,14 @@ if(isset($_GET['delete'])) {
     
     // Log audit
     $log = $conn->prepare("INSERT INTO audit_logs (user_id, action, table_name, record_id, details) VALUES (?, 'DELETE', 'products', ?, ?)");
-    $log->execute([$_SESSION['user_id'], $id, "Deleted product: " . ($product['name'] ?? 'Unknown')]);
+    $log->execute([$_SESSION['user_id'], $id, "Deleted product: $product_name"]);
+    
+    // ADD WEBSOCKET BROADCAST FOR PRODUCT DELETED
+    broadcastWebSocket('product_deleted', [
+        'id' => $id,
+        'name' => $product_name,
+        'action_by' => $_SESSION['full_name']
+    ]);
     
     header("Location: products.php?msg=deleted");
     exit();
@@ -283,6 +304,45 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
             display: flex;
             gap: 5px;
         }
+        
+        /* Notification Styles */
+        .notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 9999;
+            animation: slideIn 0.3s ease;
+        }
+        .notification-content {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            padding: 12px 20px;
+            min-width: 250px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .notification-success { border-left: 4px solid #28a745; }
+        .notification-info { border-left: 4px solid #17a2b8; }
+        .notification-warning { border-left: 4px solid #ffc107; }
+        .notification-close {
+            margin-left: auto;
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 18px;
+            color: #999;
+        }
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        @keyframes slideOut {
+            from { transform: translateX(0); opacity: 1; }
+            to { transform: translateX(100%); opacity: 0; }
+        }
+        
         @media (max-width: 768px) {
             .sidebar {
                 width: 200px;
@@ -328,6 +388,7 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
                     <?php 
                     if($_GET['msg'] == 'added') echo "✅ Product added successfully!";
                     if($_GET['msg'] == 'deleted') echo "✅ Product deleted successfully!";
+                    if($_GET['msg'] == 'updated') echo "✅ Product updated successfully!";
                     ?>
                 </div>
             <?php endif; ?>
@@ -487,6 +548,110 @@ $categories = $conn->query("SELECT * FROM categories")->fetchAll();
                 msg.style.display = 'none';
             }
         }, 3000);
+        
+        // ========== WEBSOCKET CLIENT ==========
+        let ws;
+        let reconnectAttempts = 0;
+        
+        function connectWebSocket() {
+            ws = new WebSocket('ws://localhost:8080');
+            
+            ws.onopen = function() {
+                console.log('✅ Connected to WebSocket');
+                reconnectAttempts = 0;
+                
+                // Authenticate
+                ws.send(JSON.stringify({
+                    type: 'auth',
+                    user_id: <?php echo $_SESSION['user_id']; ?>,
+                    role: '<?php echo $_SESSION['role']; ?>'
+                }));
+                
+                // Send ping every 30 seconds
+                setInterval(() => {
+                    if(ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'ping' }));
+                    }
+                }, 30000);
+            };
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                
+                switch(data.type) {
+                    case 'welcome':
+                        showNotification('Connected to real-time server', 'success');
+                        break;
+                        
+                    case 'crud':
+                        handleCRUDEvent(data);
+                        break;
+                        
+                    case 'pong':
+                        // Keep alive
+                        break;
+                }
+            };
+            
+            ws.onclose = function() {
+                console.log('❌ WebSocket Disconnected');
+                if(reconnectAttempts < 5) {
+                    reconnectAttempts++;
+                    setTimeout(connectWebSocket, 3000);
+                }
+            };
+        }
+        
+        function handleCRUDEvent(data) {
+            const { action, data: eventData } = data;
+            
+            switch(action) {
+                case 'product_added':
+                    showNotification(`🆕 New product: ${eventData.name} added by ${eventData.action_by}`, 'info');
+                    break;
+                    
+                case 'product_updated':
+                    showNotification(`✏️ Product updated: ${eventData.name}`, 'info');
+                    break;
+                    
+                case 'product_deleted':
+                    showNotification(`🗑️ Product deleted: ${eventData.name}`, 'warning');
+                    break;
+                    
+                case 'order_placed':
+                    showNotification(`📦 New order #${eventData.order_number} from ${eventData.username}`, 'success');
+                    break;
+            }
+            
+            // Refresh page if on products page
+            if(action.includes('product') && window.location.href.includes('products.php')) {
+                setTimeout(() => location.reload(), 2000);
+            }
+        }
+        
+        function showNotification(message, type = 'info') {
+            const notification = document.createElement('div');
+            notification.className = `notification notification-${type}`;
+            notification.innerHTML = `
+                <div class="notification-content notification-${type}">
+                    <span>${type === 'success' ? '✅' : type === 'warning' ? '⚠️' : '🔔'}</span>
+                    <span>${message}</span>
+                    <button class="notification-close" onclick="this.parentElement.parentElement.remove()">×</button>
+                </div>
+            `;
+            
+            document.body.appendChild(notification);
+            
+            setTimeout(() => {
+                if(notification.parentElement) {
+                    notification.style.animation = 'slideOut 0.3s ease';
+                    setTimeout(() => notification.remove(), 300);
+                }
+            }, 5000);
+        }
+        
+        // Connect WebSocket when page loads
+        document.addEventListener('DOMContentLoaded', connectWebSocket);
     </script>
 </body>
 </html>
