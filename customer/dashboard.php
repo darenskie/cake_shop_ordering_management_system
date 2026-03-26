@@ -11,14 +11,74 @@ if(!isset($_SESSION['user_id']) || $_SESSION['role'] != 'customer') {
 // Generate unique token for idempotency (prevents duplicate orders)
 $order_token = md5(uniqid(rand(), true));
 
-// Get customer's orders (still via HTTP for initial load)
+// Get customer's orders
 $my_orders = $conn->prepare("SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 5");
 $my_orders->execute([$_SESSION['user_id']]);
 $orders = $my_orders->fetchAll();
 
+// FALLBACK: Get products via PHP (so they display immediately)
+$products_fallback = $conn->query("
+    SELECT p.*, c.name as category_name 
+    FROM products p 
+    LEFT JOIN categories c ON p.category_id = c.id 
+    WHERE p.status = 'available' AND p.stock > 0
+    ORDER BY p.id DESC
+")->fetchAll();
+
 // Handle success message from redirect
 if(isset($_GET['success'])) {
     $success = "Order placed successfully! Order number: " . htmlspecialchars($_GET['order']);
+}
+
+// Handle HTTP POST order (fallback)
+if(isset($_POST['place_order_http'])) {
+    $product_id = $_POST['product_id'];
+    $quantity = $_POST['quantity'];
+    $address = $_POST['address'];
+    $order_token = $_POST['order_token'];
+    
+    // Check if already processed
+    $check = $conn->prepare("SELECT id FROM orders WHERE order_token = ?");
+    $check->execute([$order_token]);
+    
+    if($check->rowCount() == 0) {
+        $prod = $conn->prepare("SELECT price, name, stock FROM products WHERE id = ?");
+        $prod->execute([$product_id]);
+        $product = $prod->fetch();
+        
+        if($product && $product['stock'] >= $quantity) {
+            $total = $product['price'] * $quantity;
+            $order_number = 'ORD-' . date('Ymd') . '-' . rand(1000, 9999);
+            
+            $stmt = $conn->prepare("INSERT INTO orders (user_id, order_number, total_amount, shipping_address, status, order_token) VALUES (?, ?, ?, ?, 'pending', ?)");
+            $stmt->execute([$_SESSION['user_id'], $order_number, $total, $address, $order_token]);
+            $order_id = $conn->lastInsertId();
+            
+            $item = $conn->prepare("INSERT INTO order_items (order_id, product_id, quantity, price, subtotal) VALUES (?, ?, ?, ?, ?)");
+            $item->execute([$order_id, $product_id, $quantity, $product['price'], $total]);
+            
+            $update = $conn->prepare("UPDATE products SET stock = stock - ? WHERE id = ?");
+            $update->execute([$quantity, $product_id]);
+            
+            $log = $conn->prepare("INSERT INTO audit_logs (user_id, action, table_name, record_id, details) VALUES (?, 'ORDER', 'orders', ?, ?)");
+            $log->execute([$_SESSION['user_id'], $order_id, "Placed order for " . $product['name']]);
+            
+            broadcastWebSocket('order_placed', [
+                'order_id' => $order_id,
+                'order_number' => $order_number,
+                'username' => $_SESSION['full_name'],
+                'total_amount' => $total,
+                'product_name' => $product['name']
+            ]);
+            
+            header("Location: dashboard.php?success=1&order=" . $order_number);
+            exit();
+        } else {
+            $error = "Not enough stock! Only " . ($product['stock'] ?? 0) . " items available.";
+        }
+    } else {
+        $error = "This order has already been processed!";
+    }
 }
 ?>
 <!DOCTYPE html>
@@ -343,6 +403,10 @@ if(isset($_GET['success'])) {
             <div class="success">✅ <?php echo $success; ?></div>
         <?php endif; ?>
         
+        <?php if(isset($error)): ?>
+            <div class="error">❌ <?php echo $error; ?></div>
+        <?php endif; ?>
+        
         <div class="welcome">
             <h1>Welcome to Cake Shop! 🎂</h1>
             <p>Browse our delicious cakes and place your order in real-time.</p>
@@ -350,7 +414,57 @@ if(isset($_GET['success'])) {
         
         <h2 class="section-title">🍰 Available Cakes</h2>
         <div id="productsGrid" class="products-grid">
-            <div style="text-align: center; padding: 40px;">Loading products...</div>
+            <?php if(count($products_fallback) > 0): ?>
+                <?php foreach($products_fallback as $product): ?>
+                <div class="product-card">
+                    <div class="product-image-container">
+                        <?php 
+                        $image_url = '';
+                        if(!empty($product['image'])) {
+                            if(filter_var($product['image'], FILTER_VALIDATE_URL)) {
+                                $image_url = $product['image'];
+                            } else {
+                                $image_path = '../' . $product['image'];
+                                if(file_exists($image_path)) {
+                                    $image_url = '../' . $product['image'];
+                                }
+                            }
+                        }
+                        if($image_url): ?>
+                            <img src="<?php echo htmlspecialchars($image_url); ?>" class="product-image" alt="<?php echo htmlspecialchars($product['name']); ?>">
+                        <?php else: ?>
+                            <div class="no-image">
+                                <?php
+                                $name = strtolower($product['name']);
+                                if(strpos($name, 'chocolate') !== false) echo '🍫';
+                                elseif(strpos($name, 'strawberry') !== false) echo '🍓';
+                                elseif(strpos($name, 'vanilla') !== false) echo '🍦';
+                                elseif(strpos($name, 'red velvet') !== false) echo '❤️';
+                                elseif(strpos($name, 'carrot') !== false) echo '🥕';
+                                elseif(strpos($name, 'cheese') !== false) echo '🧀';
+                                elseif(strpos($name, 'cupcake') !== false) echo '🧁';
+                                else echo '🍰';
+                                ?>
+                                <span><?php echo htmlspecialchars($product['name']); ?></span>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                    <div class="product-info">
+                        <div class="category"><?php echo htmlspecialchars($product['category_name'] ?? 'Cake'); ?></div>
+                        <h3><?php echo htmlspecialchars($product['name']); ?></h3>
+                        <div class="price">₱<?php echo number_format($product['price'], 2); ?></div>
+                        <div class="stock <?php echo $product['stock'] <= 5 ? 'out-of-stock' : ''; ?>">
+                            📦 In Stock: <?php echo $product['stock']; ?> left
+                        </div>
+                        <button class="order-btn" onclick="openOrderModal(<?php echo $product['id']; ?>, '<?php echo addslashes($product['name']); ?>', <?php echo $product['price']; ?>, <?php echo $product['stock']; ?>)">
+                            🛒 Order Now
+                        </button>
+                    </div>
+                </div>
+                <?php endforeach; ?>
+            <?php else: ?>
+                <div style="text-align: center; padding: 40px;">🍰 No products available.</div>
+            <?php endif; ?>
         </div>
         
         <h2 class="section-title">📦 My Recent Orders</h2>
@@ -383,9 +497,10 @@ if(isset($_GET['success'])) {
         <div class="modal-content">
             <span class="close" onclick="closeModal()">&times;</span>
             <h2>📝 Place Your Order</h2>
-            <form id="orderForm">
-                <input type="hidden" id="product_id">
-                <input type="hidden" id="order_token" value="<?php echo $order_token; ?>">
+            <form id="orderForm" method="POST">
+                <input type="hidden" name="product_id" id="product_id">
+                <input type="hidden" name="place_order_http" value="1">
+                <input type="hidden" name="order_token" id="order_token" value="<?php echo $order_token; ?>">
                 
                 <label>🍰 Product</label>
                 <input type="text" id="product_name" readonly style="background:#f5f5f5;">
@@ -394,13 +509,13 @@ if(isset($_GET['success'])) {
                 <input type="text" id="product_price" readonly style="background:#f5f5f5;">
                 
                 <label>🔢 Quantity</label>
-                <input type="number" id="quantity" min="1" value="1" required onchange="updateTotal()">
+                <input type="number" name="quantity" id="quantity" min="1" value="1" required onchange="updateTotal()">
                 
                 <label>💵 Total Amount</label>
                 <input type="text" id="total_amount" readonly style="background:#f5f5f5; font-weight:bold; color:#ff6b6b;">
                 
                 <label>📍 Shipping Address</label>
-                <textarea id="address" rows="3" placeholder="Enter your complete address" required></textarea>
+                <textarea name="address" id="address" rows="3" placeholder="Enter your complete address" required></textarea>
                 
                 <button type="submit" class="order-btn" style="margin-top:15px;">✅ Confirm Order</button>
             </form>
@@ -418,7 +533,7 @@ if(isset($_GET['success'])) {
         let currentStock = 0;
         let currentProductName = '';
         
-        // ========== WEBSOCKET CLIENT ==========
+        // ========== WEBSOCKET CLIENT (for notifications only) ==========
         let ws;
         let reconnectAttempts = 0;
         
@@ -457,34 +572,21 @@ if(isset($_GET['success'])) {
                         
                     case 'auth_success':
                         console.log('Authenticated successfully');
-                        // Refresh products after authentication
-                        refreshProducts();
-                        break;
-                        
-                    case 'PRODUCT_LIST':
-                        displayProducts(data.payload);
                         break;
                         
                     case 'PRODUCT_CREATED':
                         showNotification(`🆕 New product available: ${data.payload.name}`, 'info');
-                        refreshProducts();
+                        location.reload();
                         break;
                         
                     case 'PRODUCT_UPDATED':
                         showNotification(`✏️ Product updated: ${data.payload.name}`, 'info');
-                        refreshProducts();
+                        location.reload();
                         break;
                         
                     case 'PRODUCT_DELETED':
                         showNotification(`🗑️ Product removed: ${data.payload.name}`, 'warning');
-                        refreshProducts();
-                        break;
-                        
-                    case 'ORDER_SUCCESS':
-                        showNotification(`✅ ${data.message} - Order #${data.order_number}`, 'success');
-                        closeModal();
-                        // Refresh orders
-                        setTimeout(() => location.reload(), 1500);
+                        location.reload();
                         break;
                         
                     case 'ORDER_CREATED':
@@ -511,124 +613,8 @@ if(isset($_GET['success'])) {
             };
         }
         
-        function refreshProducts() {
-            if(ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    type: 'READ_PRODUCTS',
-                    payload: {}
-                }));
-            }
-        }
-        
-        function displayProducts(products) {
-            const grid = document.getElementById('productsGrid');
-            if(!grid) return;
-            
-            if(products.length === 0) {
-                grid.innerHTML = '<div style="text-align: center; padding: 40px;">🍰 No products available.</div>';
-                return;
-            }
-            
-            let html = '';
-            products.forEach(product => {
-                // Only show available products with stock
-                if(product.status !== 'available' || product.stock <= 0) return;
-                
-                let imageHtml = '';
-                if(product.image) {
-                    if(product.image.startsWith('http')) {
-                        imageHtml = `<img src="${escapeHtml(product.image)}" class="product-image" alt="${escapeHtml(product.name)}">`;
-                    } else {
-                        imageHtml = `<img src="../${escapeHtml(product.image)}" class="product-image" alt="${escapeHtml(product.name)}">`;
-                    }
-                } else {
-                    // Show emoji based on product name
-                    let emoji = '🍰';
-                    const name = product.name.toLowerCase();
-                    if(name.includes('chocolate')) emoji = '🍫';
-                    else if(name.includes('strawberry')) emoji = '🍓';
-                    else if(name.includes('vanilla')) emoji = '🍦';
-                    else if(name.includes('red velvet')) emoji = '❤️';
-                    else if(name.includes('carrot')) emoji = '🥕';
-                    else if(name.includes('cheese')) emoji = '🧀';
-                    else if(name.includes('cupcake')) emoji = '🧁';
-                    
-                    imageHtml = `<div class="no-image">${emoji}<span>${escapeHtml(product.name)}</span></div>`;
-                }
-                
-                html += `
-                    <div class="product-card">
-                        <div class="product-image-container">
-                            ${imageHtml}
-                        </div>
-                        <div class="product-info">
-                            <div class="category">${escapeHtml(product.category_name || 'Cake')}</div>
-                            <h3>${escapeHtml(product.name)}</h3>
-                            <div class="price">₱${parseFloat(product.price).toFixed(2)}</div>
-                            <div class="stock ${product.stock <= 5 ? 'out-of-stock' : ''}">
-                                📦 In Stock: ${product.stock} left
-                            </div>
-                            <button class="order-btn" onclick="openOrderModal(${product.id}, '${escapeHtml(product.name)}', ${product.price}, ${product.stock})">
-                                🛒 Order Now
-                            </button>
-                        </div>
-                    </div>
-                `;
-            });
-            
-            if(html === '') {
-                grid.innerHTML = '<div style="text-align: center; padding: 40px;">🍰 No products available.</div>';
-            } else {
-                grid.innerHTML = html;
-            }
-        }
-        
-        function escapeHtml(str) {
-            if(!str) return '';
-            return str.replace(/[&<>]/g, function(m) {
-                if(m === '&') return '&amp;';
-                if(m === '<') return '&lt;';
-                if(m === '>') return '&gt;';
-                return m;
-            });
-        }
-        
-        // CREATE ORDER via WebSocket
-        function placeOrder() {
-            const product_id = currentProductId;
-            const quantity = parseInt(document.getElementById('quantity').value);
-            const address = document.getElementById('address').value;
-            const order_token = document.getElementById('order_token').value;
-            
-            if(!address) {
-                showNotification('Please enter your shipping address', 'warning');
-                return;
-            }
-            
-            if(quantity > currentStock) {
-                showNotification(`Only ${currentStock} items available!`, 'warning');
-                return;
-            }
-            
-            if(ws && ws.readyState === WebSocket.OPEN) {
-                showLoading(true);
-                ws.send(JSON.stringify({
-                    type: 'CREATE_ORDER',
-                    payload: {
-                        user_id: <?php echo $_SESSION['user_id']; ?>,
-                        product_id: product_id,
-                        quantity: quantity,
-                        address: address,
-                        order_token: order_token
-                    }
-                }));
-                showLoading(false);
-            } else {
-                showNotification('WebSocket not connected. Please refresh the page.', 'warning');
-            }
-        }
-        
         function openOrderModal(id, name, price, stock) {
+            console.log('🔍 Opening order modal for:', name, 'Stock:', stock);
             currentProductId = id;
             currentPrice = price;
             currentStock = stock;
@@ -641,6 +627,7 @@ if(isset($_GET['success'])) {
             document.getElementById('quantity').max = stock;
             document.getElementById('total_amount').value = '₱' + price.toFixed(2);
             document.getElementById('address').value = '';
+            document.getElementById('order_token').value = '<?php echo $order_token; ?>';
             document.getElementById('orderModal').style.display = 'block';
         }
         
@@ -682,13 +669,6 @@ if(isset($_GET['success'])) {
             }, 5000);
         }
         
-        function showLoading(show) {
-            const overlay = document.getElementById('loadingOverlay');
-            if(overlay) {
-                overlay.style.display = show ? 'flex' : 'none';
-            }
-        }
-        
         // Auto-hide success/error message after 5 seconds
         setTimeout(function() {
             const success = document.querySelector('.success');
@@ -704,17 +684,38 @@ if(isset($_GET['success'])) {
             }
         };
         
-        // Form submission handler
+        // Show loading on form submit
         document.addEventListener('DOMContentLoaded', function() {
             const form = document.getElementById('orderForm');
             if(form) {
                 form.addEventListener('submit', function(e) {
-                    e.preventDefault();
-                    placeOrder();
+                    const address = document.getElementById('address').value;
+                    const quantity = parseInt(document.getElementById('quantity').value);
+                    
+                    if(!address) {
+                        e.preventDefault();
+                        showNotification('Please enter your shipping address', 'warning');
+                        return false;
+                    }
+                    
+                    if(quantity > currentStock) {
+                        e.preventDefault();
+                        showNotification(`Only ${currentStock} items available!`, 'warning');
+                        return false;
+                    }
+                    
+                    showLoading(true);
                 });
             }
             connectWebSocket();
         });
+        
+        function showLoading(show) {
+            const overlay = document.getElementById('loadingOverlay');
+            if(overlay) {
+                overlay.style.display = show ? 'flex' : 'none';
+            }
+        }
     </script>
 </body>
 </html>
