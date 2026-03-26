@@ -604,6 +604,7 @@ if($last_month['revenue'] > 0) {
     </style>
 </head>
 <body>
+    <button class="menu-toggle" onclick="toggleSidebar()">☰ Menu</button>
     <div class="dashboard">
         <!-- Sidebar -->
         <div class="sidebar">

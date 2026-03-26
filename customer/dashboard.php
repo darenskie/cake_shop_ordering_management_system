@@ -390,6 +390,7 @@ if(isset($_POST['place_order_http'])) {
     </style>
 </head>
 <body>
+    <button class="menu-toggle" onclick="toggleSidebar()">☰ Menu</button>
     <div class="header">
         <div class="logo">🍰 <span style="color:#ff6b6b;">Cake</span> Shop</div>
         <div class="user-info">

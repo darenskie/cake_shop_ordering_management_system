@@ -72,6 +72,7 @@ $users = $conn->query("SELECT id, username, email, full_name, role, created_at F
     </style>
 </head>
 <body>
+    <button class="menu-toggle" onclick="toggleSidebar()">☰ Menu</button>
     <div class="dashboard">
         <div class="sidebar">
             <h2>🍰 <span>Admin</span></h2>
