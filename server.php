@@ -13,7 +13,6 @@ class CakeShopWebSocket implements MessageComponentInterface {
     protected $users;
     protected $conn;
     
-    // Pass database connection in constructor
     public function __construct($database) {
         $this->clients = new \SplObjectStorage;
         $this->users = [];
@@ -25,11 +24,12 @@ class CakeShopWebSocket implements MessageComponentInterface {
         echo "🔌 Port: 8080\n";
         echo "⏰ Time: " . date('Y-m-d H:i:s') . "\n";
         echo "🔄 Full WebSocket CRUD: ENABLED\n";
-        echo "📖 Read via WebSocket: ENABLED\n";
-        echo "✏️ Create/Update/Delete via WebSocket: ENABLED\n";
+        echo "📦 Products CRUD: YES (Create/Read/Update/Delete)\n";
+        echo "📦 Orders CRUD: YES (Create/Read/Update)\n";
+        echo "📦 Users CRUD: YES (Create/Read/Update)\n";
+        echo "📦 Categories CRUD: YES (Create/Read/Update/Delete)\n";
         echo "====================================\n";
         
-        // Test database connection
         try {
             $stmt = $this->conn->query("SELECT COUNT(*) FROM products");
             $count = $stmt->fetchColumn();
@@ -46,7 +46,6 @@ class CakeShopWebSocket implements MessageComponentInterface {
         echo "🔗 New connection! (ID: {$conn->resourceId})\n";
         echo "👥 Total clients: " . count($this->clients) . "\n";
         
-        // Send welcome message
         $conn->send(json_encode([
             'type' => 'welcome',
             'message' => 'Connected to Cake Shop WebSocket Server',
@@ -64,41 +63,72 @@ class CakeShopWebSocket implements MessageComponentInterface {
         }
         
         switch($data['type']) {
+            // Authentication
             case 'auth':
                 $this->handleAuth($from, $data);
                 break;
-                
+            
+            // ========== PRODUCTS CRUD ==========
             case 'READ_PRODUCTS':
                 $this->handleReadProducts($from, $data);
                 break;
-                
             case 'CREATE_PRODUCT':
                 $this->handleCreateProduct($from, $data);
                 break;
-                
             case 'UPDATE_PRODUCT':
                 $this->handleUpdateProduct($from, $data);
                 break;
-                
             case 'DELETE_PRODUCT':
                 $this->handleDeleteProduct($from, $data);
                 break;
-                
+            
+            // ========== ORDERS CRUD ==========
             case 'READ_ORDERS':
                 $this->handleReadOrders($from, $data);
                 break;
-                
             case 'CREATE_ORDER':
                 $this->handleCreateOrder($from, $data);
                 break;
-                
+            case 'UPDATE_ORDER_STATUS':
+                $this->handleUpdateOrderStatus($from, $data);
+                break;
+            
+            // ========== USERS CRUD ==========
+            case 'READ_USERS':
+                $this->handleReadUsers($from, $data);
+                break;
+            case 'CREATE_USER':
+                $this->handleCreateUser($from, $data);
+                break;
+            case 'UPDATE_USER_ROLE':
+                $this->handleUpdateUserRole($from, $data);
+                break;
+            case 'DELETE_USER':
+                $this->handleDeleteUser($from, $data);
+                break;
+            
+            // ========== CATEGORIES CRUD ==========
+            case 'READ_CATEGORIES':
+                $this->handleReadCategories($from, $data);
+                break;
+            case 'CREATE_CATEGORY':
+                $this->handleCreateCategory($from, $data);
+                break;
+            case 'UPDATE_CATEGORY':
+                $this->handleUpdateCategory($from, $data);
+                break;
+            case 'DELETE_CATEGORY':
+                $this->handleDeleteCategory($from, $data);
+                break;
+            
+            // Keep alive
             case 'ping':
                 $from->send(json_encode([
                     'type' => 'pong',
                     'timestamp' => date('Y-m-d H:i:s')
                 ]));
                 break;
-                
+            
             default:
                 $from->send(json_encode([
                     'type' => 'error',
@@ -107,6 +137,7 @@ class CakeShopWebSocket implements MessageComponentInterface {
         }
     }
     
+    // ========== AUTHENTICATION ==========
     public function handleAuth($from, $data) {
         if(isset($data['user_id'])) {
             $this->users[$from->resourceId] = [
@@ -132,13 +163,9 @@ class CakeShopWebSocket implements MessageComponentInterface {
         }
     }
     
+    // ========== PRODUCTS CRUD ==========
     public function handleReadProducts($from, $data) {
         try {
-            if(!$this->conn) {
-                throw new Exception("Database connection not available");
-            }
-            
-            // Get all available products with stock > 0
             $sql = "SELECT p.*, c.name as category_name 
                     FROM products p 
                     LEFT JOIN categories c ON p.category_id = c.id 
@@ -149,34 +176,14 @@ class CakeShopWebSocket implements MessageComponentInterface {
             $stmt->execute();
             $products = $stmt->fetchAll(PDO::FETCH_ASSOC);
             
-            // Convert to array with proper formatting
-            $productList = [];
-            foreach($products as $product) {
-                $productList[] = [
-                    'id' => (int)$product['id'],
-                    'name' => $product['name'],
-                    'description' => $product['description'],
-                    'price' => (float)$product['price'],
-                    'stock' => (int)$product['stock'],
-                    'image' => $product['image'],
-                    'category_id' => $product['category_id'] ? (int)$product['category_id'] : null,
-                    'category_name' => $product['category_name'],
-                    'status' => $product['status']
-                ];
-            }
-            
-            $response = json_encode([
+            $from->send(json_encode([
                 'type' => 'PRODUCT_LIST',
-                'payload' => $productList,
-                'count' => count($productList),
+                'payload' => $products,
+                'count' => count($products),
                 'timestamp' => date('Y-m-d H:i:s')
-            ]);
-            
-            $from->send($response);
-            echo "📤 Sent " . count($productList) . " products to client\n";
-            
+            ]));
+            echo "📤 Sent " . count($products) . " products to client\n";
         } catch(Exception $e) {
-            echo "❌ Error: " . $e->getMessage() . "\n";
             $from->send(json_encode([
                 'type' => 'error',
                 'message' => 'Failed to fetch products: ' . $e->getMessage()
@@ -188,7 +195,7 @@ class CakeShopWebSocket implements MessageComponentInterface {
         try {
             $product = $data['payload'];
             $name = $product['name'];
-            $category_id = $product['category_id'];
+            $category_id = $product['category_id'] ?? null;
             $price = $product['price'];
             $stock = $product['stock'];
             $description = $product['description'] ?? '';
@@ -202,25 +209,25 @@ class CakeShopWebSocket implements MessageComponentInterface {
             $getProduct->execute([$new_id]);
             $newProduct = $getProduct->fetch(PDO::FETCH_ASSOC);
             
-            $newProduct['action_by'] = $this->users[$from->resourceId]['username'] ?? 'Admin';
-            $newProduct['action_type'] = 'created';
+            // Send ACK to sender
+            $from->send(json_encode([
+                'type' => 'PRODUCT_CREATED_ACK',
+                'status' => 'success',
+                'message' => 'Product created successfully',
+                'product' => $newProduct
+            ]));
             
+            // Broadcast to ALL clients
             $broadcast = json_encode([
-                'type' => 'PRODUCT_CREATED',
-                'payload' => $newProduct,
-                'timestamp' => date('Y-m-d H:i:s')
+                'type' => 'PRODUCT_BROADCAST',
+                'action' => 'created',
+                'product' => $newProduct,
+                'action_by' => $this->users[$from->resourceId]['username'] ?? 'Admin'
             ]);
             
             foreach ($this->clients as $client) {
                 $client->send($broadcast);
             }
-            
-            $from->send(json_encode([
-                'type' => 'CREATE_SUCCESS',
-                'message' => 'Product created successfully',
-                'product' => $newProduct,
-                'timestamp' => date('Y-m-d H:i:s')
-            ]));
             
             echo "✅ Product created: $name (ID: $new_id)\n";
         } catch(Exception $e) {
@@ -236,7 +243,7 @@ class CakeShopWebSocket implements MessageComponentInterface {
             $product = $data['payload'];
             $id = $product['id'];
             $name = $product['name'];
-            $category_id = $product['category_id'];
+            $category_id = $product['category_id'] ?? null;
             $price = $product['price'];
             $stock = $product['stock'];
             $description = $product['description'] ?? '';
@@ -250,24 +257,24 @@ class CakeShopWebSocket implements MessageComponentInterface {
             $getProduct->execute([$id]);
             $updatedProduct = $getProduct->fetch(PDO::FETCH_ASSOC);
             
-            $updatedProduct['action_by'] = $this->users[$from->resourceId]['username'] ?? 'Admin';
-            $updatedProduct['action_type'] = 'updated';
+            // Send ACK to sender
+            $from->send(json_encode([
+                'type' => 'PRODUCT_UPDATED_ACK',
+                'status' => 'success',
+                'message' => 'Product updated successfully'
+            ]));
             
+            // Broadcast to ALL clients
             $broadcast = json_encode([
-                'type' => 'PRODUCT_UPDATED',
-                'payload' => $updatedProduct,
-                'timestamp' => date('Y-m-d H:i:s')
+                'type' => 'PRODUCT_BROADCAST',
+                'action' => 'updated',
+                'product' => $updatedProduct,
+                'action_by' => $this->users[$from->resourceId]['username'] ?? 'Admin'
             ]);
             
             foreach ($this->clients as $client) {
                 $client->send($broadcast);
             }
-            
-            $from->send(json_encode([
-                'type' => 'UPDATE_SUCCESS',
-                'message' => 'Product updated successfully',
-                'timestamp' => date('Y-m-d H:i:s')
-            ]));
             
             echo "✅ Product updated: $name (ID: $id)\n";
         } catch(Exception $e) {
@@ -297,27 +304,25 @@ class CakeShopWebSocket implements MessageComponentInterface {
             $stmt = $this->conn->prepare("DELETE FROM products WHERE id = ?");
             $stmt->execute([$id]);
             
-            $deletedData = [
-                'id' => $id,
-                'name' => $product['name'] ?? $name,
-                'action_by' => $this->users[$from->resourceId]['username'] ?? 'Admin'
-            ];
+            // Send ACK to sender
+            $from->send(json_encode([
+                'type' => 'PRODUCT_DELETED_ACK',
+                'status' => 'success',
+                'message' => 'Product deleted successfully'
+            ]));
             
+            // Broadcast to ALL clients
             $broadcast = json_encode([
-                'type' => 'PRODUCT_DELETED',
-                'payload' => $deletedData,
-                'timestamp' => date('Y-m-d H:i:s')
+                'type' => 'PRODUCT_BROADCAST',
+                'action' => 'deleted',
+                'product_id' => $id,
+                'product_name' => $product['name'] ?? $name,
+                'action_by' => $this->users[$from->resourceId]['username'] ?? 'Admin'
             ]);
             
             foreach ($this->clients as $client) {
                 $client->send($broadcast);
             }
-            
-            $from->send(json_encode([
-                'type' => 'DELETE_SUCCESS',
-                'message' => 'Product deleted successfully',
-                'timestamp' => date('Y-m-d H:i:s')
-            ]));
             
             echo "🗑️ Product deleted: {$product['name']} (ID: $id)\n";
         } catch(Exception $e) {
@@ -328,15 +333,16 @@ class CakeShopWebSocket implements MessageComponentInterface {
         }
     }
     
+    // ========== ORDERS CRUD ==========
     public function handleReadOrders($from, $data) {
         try {
             $user_id = $data['payload']['user_id'] ?? null;
             
             if($user_id) {
-                $stmt = $this->conn->prepare("SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 5");
+                $stmt = $this->conn->prepare("SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 10");
                 $stmt->execute([$user_id]);
             } else {
-                $stmt = $this->conn->prepare("SELECT * FROM orders ORDER BY id DESC LIMIT 5");
+                $stmt = $this->conn->prepare("SELECT o.*, u.username FROM orders o JOIN users u ON o.user_id = u.id ORDER BY o.id DESC LIMIT 20");
                 $stmt->execute();
             }
             
@@ -365,7 +371,7 @@ class CakeShopWebSocket implements MessageComponentInterface {
             $product_id = $order['product_id'];
             $quantity = $order['quantity'];
             $address = $order['address'];
-            $order_token = $order['order_token'];
+            $order_token = $order['order_token'] ?? md5(uniqid(rand(), true));
             
             $check = $this->conn->prepare("SELECT id FROM orders WHERE order_token = ?");
             $check->execute([$order_token]);
@@ -412,27 +418,28 @@ class CakeShopWebSocket implements MessageComponentInterface {
             $getUser = $this->conn->prepare("SELECT username, full_name FROM users WHERE id = ?");
             $getUser->execute([$user_id]);
             $user = $getUser->fetch(PDO::FETCH_ASSOC);
-            $newOrder['username'] = $user['username'];
-            $newOrder['full_name'] = $user['full_name'];
             
+            // Send ACK to sender
+            $from->send(json_encode([
+                'type' => 'ORDER_CREATED_ACK',
+                'status' => 'success',
+                'message' => 'Order placed successfully',
+                'order_number' => $order_number,
+                'order_id' => $order_id,
+                'total' => $total
+            ]));
+            
+            // Broadcast to ALL clients
             $broadcast = json_encode([
-                'type' => 'ORDER_CREATED',
-                'payload' => $newOrder,
-                'timestamp' => date('Y-m-d H:i:s')
+                'type' => 'ORDER_BROADCAST',
+                'action' => 'created',
+                'order' => $newOrder,
+                'customer' => $user['username'] ?? 'Customer'
             ]);
             
             foreach ($this->clients as $client) {
                 $client->send($broadcast);
             }
-            
-            $from->send(json_encode([
-                'type' => 'ORDER_SUCCESS',
-                'message' => 'Order placed successfully',
-                'order_number' => $order_number,
-                'order_id' => $order_id,
-                'total' => $total,
-                'timestamp' => date('Y-m-d H:i:s')
-            ]));
             
             echo "📦 Order placed: $order_number by User $user_id\n";
         } catch(Exception $e) {
@@ -440,6 +447,343 @@ class CakeShopWebSocket implements MessageComponentInterface {
             $from->send(json_encode([
                 'type' => 'error',
                 'message' => 'Failed to place order: ' . $e->getMessage()
+            ]));
+        }
+    }
+    
+    public function handleUpdateOrderStatus($from, $data) {
+        try {
+            $order_id = $data['payload']['order_id'];
+            $status = $data['payload']['status'];
+            
+            $getOrder = $this->conn->prepare("SELECT order_number FROM orders WHERE id = ?");
+            $getOrder->execute([$order_id]);
+            $order = $getOrder->fetch(PDO::FETCH_ASSOC);
+            
+            $stmt = $this->conn->prepare("UPDATE orders SET status = ? WHERE id = ?");
+            $stmt->execute([$status, $order_id]);
+            
+            // Send ACK to sender
+            $from->send(json_encode([
+                'type' => 'ORDER_UPDATED_ACK',
+                'status' => 'success',
+                'message' => 'Order status updated successfully'
+            ]));
+            
+            // Broadcast to ALL clients
+            $broadcast = json_encode([
+                'type' => 'ORDER_BROADCAST',
+                'action' => 'status_updated',
+                'order_id' => $order_id,
+                'order_number' => $order['order_number'],
+                'new_status' => $status,
+                'action_by' => $this->users[$from->resourceId]['username'] ?? 'Admin'
+            ]);
+            
+            foreach ($this->clients as $client) {
+                $client->send($broadcast);
+            }
+            
+            echo "📦 Order status updated: {$order['order_number']} -> $status\n";
+        } catch(Exception $e) {
+            $from->send(json_encode([
+                'type' => 'error',
+                'message' => 'Failed to update order: ' . $e->getMessage()
+            ]));
+        }
+    }
+    
+    // ========== USERS CRUD ==========
+    public function handleReadUsers($from, $data) {
+        try {
+            $stmt = $this->conn->prepare("SELECT id, username, email, full_name, role, created_at FROM users ORDER BY id DESC");
+            $stmt->execute();
+            $users = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            
+            $from->send(json_encode([
+                'type' => 'USER_LIST',
+                'payload' => $users,
+                'count' => count($users),
+                'timestamp' => date('Y-m-d H:i:s')
+            ]));
+            
+            echo "📤 Sent " . count($users) . " users to client\n";
+        } catch(Exception $e) {
+            $from->send(json_encode([
+                'type' => 'error',
+                'message' => 'Failed to fetch users: ' . $e->getMessage()
+            ]));
+        }
+    }
+    
+    public function handleCreateUser($from, $data) {
+        try {
+            $user = $data['payload'];
+            $username = $user['username'];
+            $email = $user['email'];
+            $password = password_hash($user['password'], PASSWORD_DEFAULT);
+            $full_name = $user['full_name'];
+            $role = $user['role'] ?? 'customer';
+            
+            $check = $this->conn->prepare("SELECT id FROM users WHERE username = ? OR email = ?");
+            $check->execute([$username, $email]);
+            
+            if($check->rowCount() > 0) {
+                $from->send(json_encode([
+                    'type' => 'error',
+                    'message' => 'Username or email already exists'
+                ]));
+                return;
+            }
+            
+            $stmt = $this->conn->prepare("INSERT INTO users (username, email, password, full_name, role) VALUES (?, ?, ?, ?, ?)");
+            $stmt->execute([$username, $email, $password, $full_name, $role]);
+            $new_id = $this->conn->lastInsertId();
+            
+            // Send ACK to sender
+            $from->send(json_encode([
+                'type' => 'USER_CREATED_ACK',
+                'status' => 'success',
+                'message' => 'User created successfully',
+                'user_id' => $new_id
+            ]));
+            
+            // Broadcast to ALL clients
+            $broadcast = json_encode([
+                'type' => 'USER_BROADCAST',
+                'action' => 'created',
+                'username' => $username,
+                'full_name' => $full_name,
+                'role' => $role,
+                'action_by' => $this->users[$from->resourceId]['username'] ?? 'Admin'
+            ]);
+            
+            foreach ($this->clients as $client) {
+                $client->send($broadcast);
+            }
+            
+            echo "👤 User created: $username (Role: $role)\n";
+        } catch(Exception $e) {
+            $from->send(json_encode([
+                'type' => 'error',
+                'message' => 'Failed to create user: ' . $e->getMessage()
+            ]));
+        }
+    }
+    
+    public function handleUpdateUserRole($from, $data) {
+        try {
+            $user_id = $data['payload']['user_id'];
+            $role = $data['payload']['role'];
+            
+            $getUser = $this->conn->prepare("SELECT username FROM users WHERE id = ?");
+            $getUser->execute([$user_id]);
+            $user = $getUser->fetch(PDO::FETCH_ASSOC);
+            
+            $stmt = $this->conn->prepare("UPDATE users SET role = ? WHERE id = ?");
+            $stmt->execute([$role, $user_id]);
+            
+            // Send ACK to sender
+            $from->send(json_encode([
+                'type' => 'USER_UPDATED_ACK',
+                'status' => 'success',
+                'message' => 'User role updated successfully'
+            ]));
+            
+            // Broadcast to ALL clients
+            $broadcast = json_encode([
+                'type' => 'USER_BROADCAST',
+                'action' => 'role_updated',
+                'user_id' => $user_id,
+                'username' => $user['username'],
+                'new_role' => $role,
+                'action_by' => $this->users[$from->resourceId]['username'] ?? 'Admin'
+            ]);
+            
+            foreach ($this->clients as $client) {
+                $client->send($broadcast);
+            }
+            
+            echo "👤 User role updated: {$user['username']} -> $role\n";
+        } catch(Exception $e) {
+            $from->send(json_encode([
+                'type' => 'error',
+                'message' => 'Failed to update user role: ' . $e->getMessage()
+            ]));
+        }
+    }
+    
+    public function handleDeleteUser($from, $data) {
+        try {
+            $user_id = $data['payload']['user_id'];
+            
+            $getUser = $this->conn->prepare("SELECT username FROM users WHERE id = ?");
+            $getUser->execute([$user_id]);
+            $user = $getUser->fetch(PDO::FETCH_ASSOC);
+            
+            $stmt = $this->conn->prepare("DELETE FROM users WHERE id = ?");
+            $stmt->execute([$user_id]);
+            
+            // Send ACK to sender
+            $from->send(json_encode([
+                'type' => 'USER_DELETED_ACK',
+                'status' => 'success',
+                'message' => 'User deleted successfully'
+            ]));
+            
+            // Broadcast to ALL clients
+            $broadcast = json_encode([
+                'type' => 'USER_BROADCAST',
+                'action' => 'deleted',
+                'user_id' => $user_id,
+                'username' => $user['username'],
+                'action_by' => $this->users[$from->resourceId]['username'] ?? 'Admin'
+            ]);
+            
+            foreach ($this->clients as $client) {
+                $client->send($broadcast);
+            }
+            
+            echo "👤 User deleted: {$user['username']}\n";
+        } catch(Exception $e) {
+            $from->send(json_encode([
+                'type' => 'error',
+                'message' => 'Failed to delete user: ' . $e->getMessage()
+            ]));
+        }
+    }
+    
+    // ========== CATEGORIES CRUD ==========
+    public function handleReadCategories($from, $data) {
+        try {
+            $stmt = $this->conn->prepare("SELECT * FROM categories ORDER BY name");
+            $stmt->execute();
+            $categories = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            
+            $from->send(json_encode([
+                'type' => 'CATEGORY_LIST',
+                'payload' => $categories,
+                'count' => count($categories),
+                'timestamp' => date('Y-m-d H:i:s')
+            ]));
+            
+            echo "📤 Sent " . count($categories) . " categories to client\n";
+        } catch(Exception $e) {
+            $from->send(json_encode([
+                'type' => 'error',
+                'message' => 'Failed to fetch categories: ' . $e->getMessage()
+            ]));
+        }
+    }
+    
+    public function handleCreateCategory($from, $data) {
+        try {
+            $name = $data['payload']['name'];
+            
+            $stmt = $this->conn->prepare("INSERT INTO categories (name) VALUES (?)");
+            $stmt->execute([$name]);
+            $new_id = $this->conn->lastInsertId();
+            
+            $newCategory = ['id' => $new_id, 'name' => $name];
+            
+            // Send ACK to sender
+            $from->send(json_encode([
+                'type' => 'CATEGORY_CREATED_ACK',
+                'status' => 'success',
+                'message' => 'Category created successfully',
+                'category' => $newCategory
+            ]));
+            
+            // Broadcast to ALL clients
+            $broadcast = json_encode([
+                'type' => 'CATEGORY_BROADCAST',
+                'action' => 'created',
+                'category' => $newCategory,
+                'action_by' => $this->users[$from->resourceId]['username'] ?? 'Admin'
+            ]);
+            
+            foreach ($this->clients as $client) {
+                $client->send($broadcast);
+            }
+            
+            echo "📁 Category created: $name (ID: $new_id)\n";
+        } catch(Exception $e) {
+            $from->send(json_encode([
+                'type' => 'error',
+                'message' => 'Failed to create category: ' . $e->getMessage()
+            ]));
+        }
+    }
+    
+    public function handleUpdateCategory($from, $data) {
+        try {
+            $id = $data['payload']['id'];
+            $name = $data['payload']['name'];
+            
+            $stmt = $this->conn->prepare("UPDATE categories SET name = ? WHERE id = ?");
+            $stmt->execute([$name, $id]);
+            
+            // Send ACK to sender
+            $from->send(json_encode([
+                'type' => 'CATEGORY_UPDATED_ACK',
+                'status' => 'success',
+                'message' => 'Category updated successfully'
+            ]));
+            
+            // Broadcast to ALL clients
+            $broadcast = json_encode([
+                'type' => 'CATEGORY_BROADCAST',
+                'action' => 'updated',
+                'category' => ['id' => $id, 'name' => $name],
+                'action_by' => $this->users[$from->resourceId]['username'] ?? 'Admin'
+            ]);
+            
+            foreach ($this->clients as $client) {
+                $client->send($broadcast);
+            }
+            
+            echo "📁 Category updated: ID $id -> $name\n";
+        } catch(Exception $e) {
+            $from->send(json_encode([
+                'type' => 'error',
+                'message' => 'Failed to update category: ' . $e->getMessage()
+            ]));
+        }
+    }
+    
+    public function handleDeleteCategory($from, $data) {
+        try {
+            $id = $data['payload']['id'];
+            $name = $data['payload']['name'];
+            
+            $stmt = $this->conn->prepare("DELETE FROM categories WHERE id = ?");
+            $stmt->execute([$id]);
+            
+            // Send ACK to sender
+            $from->send(json_encode([
+                'type' => 'CATEGORY_DELETED_ACK',
+                'status' => 'success',
+                'message' => 'Category deleted successfully'
+            ]));
+            
+            // Broadcast to ALL clients
+            $broadcast = json_encode([
+                'type' => 'CATEGORY_BROADCAST',
+                'action' => 'deleted',
+                'category_id' => $id,
+                'category_name' => $name,
+                'action_by' => $this->users[$from->resourceId]['username'] ?? 'Admin'
+            ]);
+            
+            foreach ($this->clients as $client) {
+                $client->send($broadcast);
+            }
+            
+            echo "📁 Category deleted: $name (ID: $id)\n";
+        } catch(Exception $e) {
+            $from->send(json_encode([
+                'type' => 'error',
+                'message' => 'Failed to delete category: ' . $e->getMessage()
             ]));
         }
     }
@@ -460,13 +804,12 @@ class CakeShopWebSocket implements MessageComponentInterface {
 // Get database connection from db.php
 global $conn;
 
-// Check if database connection exists
 if(!isset($conn)) {
     echo "❌ Database connection not found! Make sure db.php is correct.\n";
     exit(1);
 }
 
-// Create WebSocket server with database connection
+// Create WebSocket server
 $server = IoServer::factory(
     new HttpServer(
         new WsServer(
@@ -479,6 +822,5 @@ $server = IoServer::factory(
 echo "🚀 Server is running! Press Ctrl+C to stop.\n";
 echo "📡 WebSocket URL: ws://localhost:8080\n";
 echo "====================================\n\n";
-
 $server->run();
 ?>
