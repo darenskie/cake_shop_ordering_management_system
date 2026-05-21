@@ -1,25 +1,31 @@
-# CakePHP 3
+﻿# Cake Shop Ordering System - .gitignore
 
-/vendor/*
-/config/app.php
+# Environment variables (contains real credentials)
+.env
 
-/tmp/cache/models/*
-!/tmp/cache/models/empty
-/tmp/cache/persistent/*
-!/tmp/cache/persistent/empty
-/tmp/cache/views/*
-!/tmp/cache/views/empty
-/tmp/sessions/*
-!/tmp/sessions/empty
-/tmp/tests/*
-!/tmp/tests/empty
+# Composer dependencies
+/vendor/
 
-/logs/*
-!/logs/empty
+# Uploaded files
+/uploads/
+/uploads/products/
 
-# CakePHP 2
+# Logs
+*.log
+error_log
 
-/app/tmp/*
-/app/Config/core.php
-/app/Config/database.php
-/vendors/*
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+
+# Keep database dump for submission
+!db_dump.sql
