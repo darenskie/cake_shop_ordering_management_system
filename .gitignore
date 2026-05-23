@@ -26,6 +26,3 @@ Thumbs.db
 *.tmp
 *.bak
 *.backup
-
-# Keep database dump for submission
-!db_dump.sql
